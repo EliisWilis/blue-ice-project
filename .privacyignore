@@ -1,0 +1,19 @@
+# Blue Ice Project blocks context that references files matching these patterns.
+.env
+.env.*
+**/.env
+**/.env.*
+*.pem
+**/*.pem
+*.key
+**/*.key
+id_rsa*
+**/id_rsa*
+*secret*
+**/*secret*
+*credential*
+**/*credential*
+*.p12
+**/*.p12
+*.pfx
+**/*.pfx
