@@ -5,7 +5,7 @@
   "description": "Plain-text TypeScript terminal client for Blue Ice Project",
   "type": "module",
   "bin": {
-    "blue-ice": "dist/index.js"
+    "blue-ice-node": "dist/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

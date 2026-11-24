@@ -316,6 +316,22 @@ def test_audit_reader_rejects_unhashable_event_metadata(tmp_path: Path):
     assert read_events(path) == []
 
 
+def test_provider_list_includes_openai(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    import yaml
+
+    from aegis.cli import provider_list
+
+    values = default_config(tmp_path)
+    values["provider"] = "openai"
+    values["project_root"] = str(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(values), encoding="utf-8")
+
+    provider_list(config=config_path)
+
+    assert "openai (selected)" in capsys.readouterr().out
+
+
 def test_cli_help_is_plain_text(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):

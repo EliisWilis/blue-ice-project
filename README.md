@@ -1,37 +1,79 @@
-# Blue Ice Project
+<div align="center">
+  <img src="assets/blue-ice-logo.png" alt="Blue Ice Project logo" width="96" />
+  <h1>Blue Ice Project</h1>
+  <p>A local OpenAI-compatible privacy gateway for coding agents</p>
+  <p>
+    <img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12 or newer" />
+    <img src="https://img.shields.io/badge/Node.js-20%2B-339933?logo=nodedotjs&logoColor=white" alt="Node.js 20 or newer for the TypeScript CLI" />
+    <img src="https://img.shields.io/badge/License-MIT-007EC6" alt="MIT License" />
+    <img src="https://img.shields.io/badge/Status-Alpha-orange" alt="Alpha software" />
+  </p>
+</div>
 
-![Blue Ice Project logo](assets/blue-ice-logo.png)
+Blue Ice Project is an early-stage local proxy that sits between a coding client and one explicitly selected AI provider. It offers bounded, configurable checks for requests and responses. It is defense in depth, not a complete security boundary, sandbox, certified gateway, or guarantee of confidentiality or zero data retention.
 
-Blue Ice Project is a local, OpenAI-compatible gateway intended to add configurable checks between coding clients and one explicitly selected model provider. It is an early-stage defense-in-depth tool, not a guarantee of security, confidentiality, or zero data retention.
+## Contents
+
+- [What it does](#what-it-does)
+- [Tech stack](#tech-stack)
+- [Supported APIs and providers](#supported-apis-and-providers)
+- [Quick start](#quick-start)
+- [Configure providers and credentials](#configure-providers-and-credentials)
+- [Use the TypeScript/Node terminal client](#use-the-typescriptnode-terminal-client)
+- [Connect an agent or OpenAI-compatible client](#connect-an-agent-or-openai-compatible-client)
+- [Commands](#commands)
+- [Security-module maturity](#security-module-maturity)
+- [Security, privacy, and operational limits](#security-privacy-and-operational-limits)
+- [Development and checks](#development-and-checks)
+- [Project documentation](#project-documentation)
 
 ## What it does
 
-The Python service exposes `GET /v1/models`, `POST /v1/chat/completions`, and a native `POST /v1/responses` route on loopback. Responses forwarding is enabled for the built-in `openai` provider or a custom provider with an explicitly registered `responses_url`; chat-only providers return `501` rather than receiving a translated request. It applies byte limits, project-path checks, in-memory secret redaction, output inspection, optional placeholder restoration, and metadata-only audit. Both protocols are buffered before delivery; for Responses SSE, all parsed frame text is inspected and frames after the terminal completion event are rejected before replay. This adds latency and does not provide incremental streaming or establish full Codex conformance.
+The service binds to a loopback IP address only (default `127.0.0.1:8080`). It requires a private local bearer token by default, applies request/response byte limits, and routes to one configured provider. Provider destinations are selected in local policy; request payloads cannot choose an outbound URL. The proxy does not rotate provider keys or silently fail over to another provider.
 
-Built-in Chat Completions destinations are OpenAI, OpenRouter, Groq, Google, Cerebras, and a loopback-only Ollama endpoint. Native Responses forwarding is available to OpenAI and to custom endpoints explicitly registered with `--responses-url`. A custom HTTPS Chat Completions endpoint is not assumed to support Responses. The provider URL is configuration, never request input. Provider selection is explicit; the proxy does not rotate keys or silently fail over to another provider.
+For requests that pass policy, the main path can:
 
-The optional LLM Guard adapter is disabled by default. ProtectAI's upstream repository is archived and is no longer actively maintained. The optional extra is pinned to the last PyPI release verified for this project (`0.3.16`); install it explicitly with `python -m pip install '.[llm-guard]'` on Python 3.12, then set `llm_guard_enabled: true` in the private config. When enabled, scanner initialization or failure blocks the request. This dependency has no PyPI provenance metadata, so enabling it is an explicit operator risk decision. See [the LLM Guard notes](docs/llm-guard.md).
+- Check recognizable file-path references against the configured project root and `.privacyignore` patterns. This is a text-reference filter, not filesystem confinement.
+- Replace recognized secrets with request-scoped placeholders before forwarding, then restore only exact placeholders after response checks. Detection is heuristic and does not guarantee secure erasure.
+- Run the optional LLM Guard adapter when explicitly enabled. It is disabled by default; scanner initialization or runtime failure blocks the request when enabled. The upstream LLM Guard repository is archived.
+- Inspect buffered model output for a limited set of risky shell-command patterns and unapproved Markdown links. This is a heuristic content check, not command-execution control.
+- Optionally query public PyPI/npm registries about package names suggested in response text. This is not an install interceptor and discloses queried package names to those registries.
+- Write bounded, owner-only, metadata-only audit events. Prompts, provider responses, API keys, and reversible secret mappings are not intended to be logged. If an audit write fails, the response is withheld and the API returns an audit error rather than silently treating the event as recorded.
 
-## Request flow
+Both Chat Completions and Responses payloads are buffered for inspection before delivery. Chat Completions SSE is recreated after checks. Responses SSE is parsed and inspected in full before replay; a terminal completion event is required and events after completion are rejected. This is not incremental streaming and adds latency and memory use.
 
-```mermaid
-flowchart LR
-    A[Agent CLI or desktop client] -->|Chat Completions or Responses to loopback| B[Blue Ice Project API]
-    B --> C[Size limit and local bearer authentication]
-    C --> D[Project path policy and secret redaction in memory]
-    D --> E{Optional LLM Guard input scan}
-    E --> F[One explicitly selected provider]
-    F --> G[Buffered complete response]
-    G --> H[Restore request-scoped placeholders]
-    H --> I{Output scan and egress checks}
-    I -->|blocked| J[Metadata-only audit]
-    I -->|allowed| K[Metadata-only audit]
-    K --> L[Agent client: JSON or buffered SSE replay]
-```
+## Tech stack
 
-## Install and start
+| Layer | Technologies | Role |
+|---|---|---|
+| Proxy service | Python 3.12+, FastAPI, Uvicorn/ASGI, asyncio | Local HTTP API and asynchronous request handling |
+| Provider transport | HTTPX | Bounded upstream HTTP requests; redirects are disabled |
+| Configuration and CLI | PyYAML, Typer | Local YAML policy and the `blue-ice` control command |
+| Credential storage | Environment variables, Python `keyring` | Provider credentials are kept out of YAML and command-line arguments |
+| Optional scanning | LLM Guard 0.3.16 extra | Opt-in scanning adapter; archived upstream, disabled by default |
+| TypeScript terminal client | TypeScript 5.6+, Node.js 20+ | Plain-text front end; Node built-ins at runtime, no extra runtime package dependencies |
+| Build and test tools | setuptools, wheel, pytest, pytest-asyncio, Ruff, mypy | Packaging, tests, lint/format, and optional development checks |
+
+The project is in **Alpha**. Versions and optional dependencies are declared in [`pyproject.toml`](pyproject.toml) and [`cli-node/package.json`](cli-node/package.json).
+
+## Supported APIs and providers
+
+| API | Availability | Notes |
+|---|---|---|
+| `GET /healthz` | Local service | Health endpoint; it is unauthenticated and does not disclose a provider key. |
+| `GET /v1/models` | Configured local service | Requires the local bearer token by default; reports models exposed by the selected configuration. |
+| `POST /v1/chat/completions` | Supported provider routes | OpenAI Chat Completions-compatible requests; provider and model must be configured. |
+| `POST /v1/responses` | Native Responses only | Available for built-in `openai` or a custom provider with an explicitly registered native `responses_url`. Other providers return `501`; no lossy Chat Completions-to-Responses translation is attempted. |
+
+Built-in Chat Completions destinations are **OpenAI, OpenRouter, Groq, Google, Cerebras, and loopback-only Ollama**. Custom providers may be registered with trusted HTTPS Chat Completions URLs. A custom Responses URL is optional and must be explicitly supplied for an upstream that implements the native Responses API.
+
+Having an OpenAI-compatible base URL does not prove that a client uses a supported route, authentication header, streaming format, tool-call format, or model feature. Client examples are not certification or end-to-end test results. See [agent integration status](docs/agent-integrations.md).
+
+## Quick start
 
 Requirements: Python 3.12 or newer. The optional TypeScript terminal client requires Node.js 20 or newer.
+
+From the repository root:
 
 ```sh
 python -m venv .venv
@@ -39,69 +81,178 @@ python -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install .
 blue-ice init --project-root /absolute/path/to/your/project --provider openrouter
+```
+
+`--project-root` must be an existing directory. `init` creates local policy and a local bearer-token file under `~/.aegis/`, plus a `.privacyignore` in the selected project unless one already exists. The `.aegis` directory is a legacy storage namespace retained for compatibility. Review the generated policy and ignore rules before connecting an agent. Do not commit local config, token, or audit files.
+
+In the same shell, set the upstream provider key without placing it in command history, then start the proxy:
+
+```sh
+read -r -s -p "OpenRouter API key: " AEGIS_OPENROUTER_API_KEY
+printf '\n'
+export AEGIS_OPENROUTER_API_KEY
 blue-ice start
 ```
 
-`init` creates local policy and bearer-token files under `~/.aegis/`. This legacy storage namespace is retained for local-data compatibility; Blue Ice Project and `blue-ice` are the product and primary command names. The token is stored in a separate owner-only file. The provider API key is never accepted as a CLI argument or written to YAML. Configure a provider-specific environment variable in the same shell that starts the service, or choose the OS keyring when prompted by `init`:
+Keep this process running. The service listens at `http://127.0.0.1:8080` by default. In a separate terminal, configure your client to use `http://127.0.0.1:8080/v1` and the local token in `~/.aegis/local-token`. The local token authenticates to Blue Ice Project; it is not the provider's API key.
+
+The `init` command can offer to store a provider key in an available OS keyring. Use that option only if the selected system keyring has a secure, working backend. The Python CLI also supports `blue-ice start --port 8081` and `blue-ice start --config /path/to/private-config.yaml`. It refuses non-loopback bind addresses.
+
+## Configure providers and credentials
+
+Provider keys are loaded from provider-specific environment variables or the OS keyring. Keys are not accepted as CLI arguments and are not supported as YAML fields. Keep key values out of source code, shell history, issue reports, and logs.
+
+| Provider | Environment variable |
+|---|---|
+| OpenAI | `AEGIS_OPENAI_API_KEY` |
+| OpenRouter | `AEGIS_OPENROUTER_API_KEY` |
+| Groq | `AEGIS_GROQ_API_KEY` |
+| Google | `AEGIS_GOOGLE_API_KEY` |
+| Cerebras | `AEGIS_CEREBRAS_API_KEY` |
+| Custom provider named `vendorx` | `AEGIS_CUSTOM_VENDORX_API_KEY` |
+| Ollama | No cloud API key; loopback endpoint only |
+
+For a different built-in provider, initialize or select it and set its corresponding key variable in the service shell. For example:
 
 ```sh
-export AEGIS_OPENROUTER_API_KEY='your-provider-key'
+blue-ice provider use openai --model '<model-id-supported-by-your-account>'
+read -r -s -p "OpenAI API key: " AEGIS_OPENAI_API_KEY
+printf '\n'
+export AEGIS_OPENAI_API_KEY
 blue-ice start
 ```
 
-Provider-key variables retain the legacy `AEGIS_` prefix: `AEGIS_OPENAI_API_KEY`, `AEGIS_OPENROUTER_API_KEY`, `AEGIS_GROQ_API_KEY`, `AEGIS_GOOGLE_API_KEY`, and `AEGIS_CEREBRAS_API_KEY`. Ollama does not require a cloud API key. A custom provider named `vendorx` uses `AEGIS_CUSTOM_VENDORX_API_KEY`. Prefer a protected secret manager or OS keyring over shell history and avoid putting credentials in project files.
-
-For custom providers, register only an endpoint you trust:
+Register a custom endpoint only if you control or trust it:
 
 ```sh
-blue-ice provider add vendorx --url https://api.vendor.example/v1/chat/completions --model my-model
-# Add --responses-url https://api.vendor.example/v1/responses only if the provider supports it.
-blue-ice provider use vendorx --model my-model
+blue-ice provider add vendorx \
+  --url https://api.vendor.example/v1/chat/completions \
+  --model vendor-model
 ```
 
-The URL is stored in the local policy file; the key remains in the selected environment or OS keyring. Custom provider destinations are currently DNS-checked for public IPs but are not pinned to those addresses for the lifetime of the HTTP connection. DNS rebinding therefore remains a residual SSRF risk; use only endpoints you control and trust.
+If, and only if, the upstream implements the native Responses API, register its separate native endpoint:
 
-## TypeScript / Node terminal client
+```sh
+blue-ice provider add vendorx \
+  --url https://api.vendor.example/v1/chat/completions \
+  --responses-url https://api.vendor.example/v1/responses \
+  --model vendor-model
+```
 
-The Node client is a plain-text command front end. It uses ordinary labels and commands, without decorative terminal symbols or ANSI styling. It does not handle provider API keys.
+`provider add` selects the new provider in local policy. Its HTTPS endpoint URL is stored in the private policy file; the API key remains in the environment or keyring. Custom hosts are checked for public DNS answers, but the address is not pinned to the HTTP connection, so DNS rebinding/TOCTOU remains a residual risk. Use only trusted endpoints.
+
+The example policy [`config.example.yaml`](config.example.yaml) contains no API keys. Defaults include a 2,000,000-byte request limit, an 8,000,000-byte response limit, local auth enabled, registry checks disabled, and LLM Guard disabled. Optional fields include `allowed_domains`, custom providers, audit/token paths, and the project root. Use a private config file; never add credentials to YAML.
+
+## Use the TypeScript/Node terminal client
+
+The Node client is an optional plain-text TypeScript front end. It uses ordinary text labels, with no decorative terminal symbols or ANSI styling. It does not read or handle provider API keys. Its `models` command reads the private local token file and calls only `127.0.0.1`; other commands delegate to the Python CLI.
+
+From the repository root, after installing the Python package:
 
 ```sh
 cd cli-node
 npm ci
 npm run build
 npm link
-blue-ice help
-blue-ice models
+blue-ice-node help
+blue-ice-node models
 ```
 
-The Python package must also be installed so the Node client can delegate policy and service commands. `blue-ice models` reads the local bearer token from `~/.aegis/local-token` or `BLUE_ICE_TOKEN_FILE` and calls only the loopback service.
+The installed command is `blue-ice-node` so it does not collide with the Python `blue-ice` executable that the Node front end uses for delegated commands. `models` accepts `--port N` if the local proxy uses a non-default port. The Python service must be initialized and running first.
 
-## Connecting an OpenAI-compatible client
+## Connect an agent or OpenAI-compatible client
 
-Set the client base URL to `http://127.0.0.1:8080/v1` and its local API key/token to the contents of `~/.aegis/local-token`. The local token authenticates to Blue Ice Project; it is not a provider API key. If a client supports environment-based configuration, a common pattern is:
+For a client that supports `OPENAI_BASE_URL` and `OPENAI_API_KEY`, set those to the local endpoint and gateway token in the agent's shell:
 
 ```sh
 export OPENAI_BASE_URL='http://127.0.0.1:8080/v1'
 export OPENAI_API_KEY="$(cat "$HOME/.aegis/local-token")"
 ```
 
-Client configuration names and API protocols differ. Codex can target `/v1/responses` when the proxy uses the OpenAI provider or a custom provider with a native `responses_url` registered; see the [agent integration guide](docs/agent-integrations.md). The route has synthetic tests for request fields, continuation, tool outputs, auth, SSE event preservation, and size limits, but has not been tested with a live Codex CLI, desktop app, upstream provider account, or Codex Security CLI. Buffered event replay does not establish full Codex gateway conformance. Other listed clients generally use Chat Completions, but their authentication, tools, and model capabilities remain client-specific.
+Use the client’s documented secret mechanism where possible. If the client asks for a base URL, enter `http://127.0.0.1:8080/v1`; if it asks for an API key, provide the local gateway token, not the upstream provider key. Client variable names differ, so verify its actual configuration and that it sends a bearer token to the proxy.
 
-## Local policy and audit
+### Codex CLI and Codex desktop
 
-The generated configuration is kept outside the project tree. `config.example.yaml` shows the supported fields and contains no API key. Review project path and `.privacyignore` settings before using an agent. The default rules reject references to common secret-bearing files; they are heuristics, not a complete data-loss-prevention system.
+The proxy has a native `/v1/responses` route only for the built-in OpenAI provider and custom providers with an explicit native `responses_url`. Codex can be configured to target this route, but Responses SSE is buffered before replay, and no live Codex CLI, desktop, or upstream-account end-to-end test has been completed. Treat the setup as **conditional and unverified**, not full compatibility.
 
-`blue-ice audit` displays a bounded number of metadata-only records. Audit files have a fixed size limit; when full, successful responses are withheld rather than returned without a recorded event. If a blocked or failed request cannot be recorded, the API returns `503 audit_unavailable` instead of silently returning its ordinary blocked/error response. Audit records can include provider identifiers, rule names, counts, timestamps, and latency, but should not include prompts, responses, credentials, or reconstructed secrets.
+A Codex configuration can use the local gateway token through an environment variable:
 
-## Security and privacy limits
+```toml
+model = "<model-id-supported-by-the-selected-provider>"
+model_provider = "blue-ice"
 
-Blue Ice Project reduces some risks; it does not eliminate them. Secret detection is incomplete, and redaction can miss encoded, split, novel, or otherwise unrecognized secrets. The remaining request content is still sent to the selected provider, whose data handling and retention are governed by that provider and account. Provider privacy headers or request preferences are not proof of zero retention.
+[model_providers.blue-ice]
+name = "Blue Ice Project"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+env_key = "BLUE_ICE_LOCAL_TOKEN"
+requires_openai_auth = false
+```
 
-The service binds to loopback by default and requires a local bearer token. Do not expose it to a LAN or public network without a separate threat review and suitable access controls. A local process with access to the token can call the proxy. There is no rate limiter, and local authentication is not a boundary against malware or a compromised user account. Review the specific residual risks in [the security review notes](docs/security-review.md).
+Set `BLUE_ICE_LOCAL_TOKEN` in the environment inherited by Codex. Select a model accepted by the upstream. Keep the provider key only in the proxy process environment or OS keyring. See [the detailed agent integration guide](docs/agent-integrations.md) before relying on this configuration.
 
-Responses are buffered before forwarding to the client; large responses consume memory up to the configured limit. Native Responses requests go to the selected OpenAI or explicitly configured custom provider, where provider-side data controls apply; this gateway does not force `store: false` or guarantee zero retention. Requests using `previous_response_id` may rely on upstream state. Custom-provider DNS is validated but not pinned, so DNS rebinding is not fully mitigated. The proxy does not verify provider claims, inspect the provider's infrastructure, or guarantee that content checks catch prompt injection, malicious code, unsafe shell commands, or package confusion. Registry checks are opt-in because queried package names are sent to public registries. Unknown or unavailable registry results are risk signals, not proof of maliciousness.
+**Codex Security CLI is not verified or claimed as supported.** Its isolated configuration and authentication behavior are separate from ordinary Codex CLI, and its documented options do not establish arbitrary local gateway compatibility. This project has not completed a Security scan through Blue Ice Project.
 
-LLM Guard is optional and upstream-archived. Enabling it does not provide a complete safety filter. An audit log can itself reveal operational metadata and should remain protected. Review bundled skills in `skills/` and `.agents/skills/` and license notices in `licenses/`; their presence does not install their tools or runtime dependencies.
+The repository also contains configuration guidance for Hermes Agent, OpenCode, OpenClaw, Cline, Roo Code, Continue, and Cursor. Those examples describe documented client configuration paths and their known caveats; they are not proof of working integrations. Check the [agent integration guide](docs/agent-integrations.md) for details.
+
+## Commands
+
+The Python CLI is `blue-ice`. The TypeScript/Node front end is `blue-ice-node` after `npm link`.
+
+| Command | Purpose |
+|---|---|
+| `blue-ice --help` | Show available commands in plain text. |
+| `blue-ice init --project-root PATH --provider NAME` | Create private policy and local token files; `--force` replaces policy settings, not an existing key. |
+| `blue-ice start [--host 127.0.0.1] [--port 8080] [--config PATH]` | Start the loopback-only API service. |
+| `blue-ice provider list [--config PATH]` | List built-in and registered provider names without credential data. |
+| `blue-ice provider use NAME [--model MODEL] [--config PATH]` | Select one built-in or registered provider explicitly. |
+| `blue-ice provider add NAME --url URL [--responses-url URL] [--model MODEL] [--keyring]` | Register a trusted HTTPS custom provider; API keys are never command-line arguments. |
+| `blue-ice audit [--limit 1..500] [--config PATH]` | Display recent metadata-only audit records; default limit is 50. |
+| `blue-ice-node models [--port N]` | Query and print models exposed by the local `/v1/models` endpoint. |
+
+For help on an individual command, run `blue-ice COMMAND --help`, for example `blue-ice provider add --help`. The Python executable is required for delegated commands from the Node client.
+
+## Security-module maturity
+
+The project was audited against a 20-module target. **None of the 20 modules is complete.** The status below distinguishes an active but partial control from a missing target; a helper file alone does not mean that a feature is integrated into the live proxy.
+
+| # | Module | Status | What exists / important boundary |
+|---:|---|---|---|
+| 1 | PID-bound session proof | Partial | Local bearer auth is on by default; no PID-bound proof or transport. |
+| 2 | RAM-only vault, memory lock, zero-fill | Partial | Request-scoped mappings are cleared; no reliable locked-memory or zeroization guarantee. |
+| 3 | Project path blast-radius sandbox | Partial | Recognized path references are checked; this is not an OS/filesystem sandbox. |
+| 4 | Git history/staged-diff secret guard | Missing | No Git history or index inspection. |
+| 5 | Indirect prompt-injection stripping | Missing | No provenance-aware injection/Unicode sanitizer. |
+| 6 | Secret, PII, and entropy redaction | Partial | Pattern and entropy heuristics with placeholders; detection is incomplete. |
+| 7 | AST code anonymizer | Partial | Opt-in helper exists but is not integrated into ingress; renaming is not scope-aware. |
+| 8 | Topology/comment scrubber | Missing | No integrated topology or comment scrubber. |
+| 9 | Differential privacy on constants | Missing / not implemented as proposed | No differential privacy. Reversible numeric scaling is not differential privacy and must not be described as such. |
+| 10 | Synthetic cryptographic honey token | Partial | Opt-in helper exists but is not wired into the proxy by default. |
+| 11 | Split inference across providers | Partial | Planning helper only; no two-provider request orchestration. |
+| 12 | Traffic padding and temporal jitter | Missing | No traffic-obfuscation control. |
+| 13 | Hybrid local/cloud prompt splitter | Partial | Optional local summarizer helper is not part of the request pipeline. |
+| 14 | ZDR routing and quota radar | Partial | Direct routing and bounded same-provider retries; no ZDR guarantee, key rotation, cross-provider fallback, or integrated quota radar. |
+| 15 | Hallucinated-package guard | Partial | Optional response-text checks for PyPI/npm; does not intercept actual install commands. |
+| 16 | Semantic egress firewall | Partial | Integrated heuristic checks on buffered output; not an execution sandbox. |
+| 17 | Encoded-secret smuggling detector | Missing | No Base64/hex output comparison detector. |
+| 18 | Git snapshot and rollback | Missing | No workspace snapshot/rollback or filesystem write control. |
+| 19 | De-anonymizer and transparency audit | Partial | Exact secret placeholders can be restored; other mapping types are not wired into the app. |
+| 20 | Cryptographic output provenance signer | Missing | No output signing or provenance verification. |
+
+See the full [security module matrix](docs/security-module-matrix.md) for evidence, limitations, and follow-up priorities. Do not advertise this project as “20/20 modules complete,” a zero-trust sandbox, or a differential-privacy system.
+
+## Security, privacy, and operational limits
+
+- **Provider data still leaves the machine.** Redaction is incomplete; all remaining request content is sent to the selected provider. Provider retention is governed by that provider and the account’s settings. Local metadata-only audit does not mean zero upstream retention. The gateway forwards Responses fields such as `store` and `previous_response_id`; it does not force `store: false`.
+- **Localhost is not a boundary against the same account.** The service uses plain HTTP on loopback. A same-user process or malware with access to the local token can call it. There is no application-level rate limit. Do not expose it to a LAN or public network.
+- **Heuristics can miss or block content.** Path rules, secret patterns, entropy thresholds, prompt scanning, command/link inspection, and package metadata checks have false positives and false negatives. They are not substitutes for least-privilege agent permissions or an OS sandbox.
+- **Responses are buffered.** Inspection delays delivery and uses memory up to the response byte limit. SSE is replayed after inspection, not forwarded incrementally.
+- **Custom DNS is not pinned.** Public DNS is validated, but validation and connection are not atomic; DNS rebinding/TOCTOU remains a residual risk.
+- **Optional checks have costs and limits.** LLM Guard is archived upstream and disabled by default. Registry checks are disabled by default and send queried package names to public PyPI/npm endpoints. Provider privacy preferences are not guarantees.
+- **Auditing fails closed, but is not tamper-proof.** A failed audit write withholds the response and surfaces `503 audit_unavailable`; it cannot create a record while storage is unavailable. Metadata logs still need local protection.
+- **No dedicated secret-scanner binary or CI/pre-commit secret scan is configured.** The prior review included a manual high-confidence pattern scan of workspace text files, not Git-history scanning. Do not assume repository history has been audited.
+
+Read [security review notes](docs/security-review.md) for residual risks and [the full module matrix](docs/security-module-matrix.md) for module-by-module findings.
 
 ## Development and checks
 
@@ -110,11 +261,24 @@ python -m pip install -e '.[dev]'
 pytest
 ruff check src tests
 ruff format --check src tests
-cd cli-node && npm ci && npm run build
+python -m compileall -q src tests
+
+cd cli-node
+npm ci
+npm run build
+node dist/index.js help
 ```
 
-This repository is an early review build. Automated tests and static checks cannot prove that the project is vulnerability-free. Report reproducible security issues without including real credentials or private prompt content.
+The Node package can also be linked locally as `blue-ice-node` with `npm link`. These checks are useful regression tests; passing them does not prove the software is vulnerability-free. Report reproducible security issues without including real credentials or private prompt content.
 
-## License and project review
+## Project documentation
 
-Blue Ice Project code is MIT licensed; see [LICENSE](LICENSE). Bundled upstream skills retain their respective licenses and attribution in `licenses/`. The requested repository slug is `blu-ice-project`; public publication remains pending an explicit final confirmation after the source, secret, and artifact review.
+- [LLM Guard notes](docs/llm-guard.md)
+- [Security review](docs/security-review.md)
+- [20-module security matrix](docs/security-module-matrix.md)
+- [Agent integration guide](docs/agent-integrations.md)
+- [Codex gateway/protocol research](docs/codex-gateway-research.md)
+- [Example configuration](config.example.yaml)
+- [MIT license](LICENSE)
+
+Blue Ice Project code is MIT licensed. Bundled upstream skills retain their respective licenses and attribution under [`licenses/`](licenses/).

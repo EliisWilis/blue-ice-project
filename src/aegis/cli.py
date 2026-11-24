@@ -348,7 +348,7 @@ def provider_list(
     except ConfigurationError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2)
-    for name in ("openrouter", "groq", "google", "cerebras", "ollama"):
+    for name in ("openai", "openrouter", "groq", "google", "cerebras", "ollama"):
         marker = " (selected)" if settings.provider == name else ""
         typer.echo(f"{name}{marker}")
     for name, endpoint in settings.custom_provider_urls:

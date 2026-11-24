@@ -12,14 +12,14 @@ function printHelp(): void {
   process.stdout.write(
     "Blue Ice Project terminal client\n\n" +
       "Commands:\n" +
-      "  blue-ice init [options]          Create local policy and auth token\n" +
-      "  blue-ice start [options]         Start the local proxy\n" +
-      "  blue-ice audit [options]         Show metadata-only audit events\n" +
-      "  blue-ice provider add ...        Register a trusted HTTPS endpoint\n" +
-      "  blue-ice provider use ...        Select one provider explicitly\n" +
-      "  blue-ice provider list           List configured providers\n" +
-      "  blue-ice models [--port N]       Query the local OpenAI-compatible API\n" +
-      "  blue-ice help                    Show this help\n\n" +
+      "  blue-ice-node init [options]          Create local policy and auth token\n" +
+      "  blue-ice-node start [options]         Start the local proxy\n" +
+      "  blue-ice-node audit [options]         Show metadata-only audit events\n" +
+      "  blue-ice-node provider add ...        Register a trusted HTTPS endpoint\n" +
+      "  blue-ice-node provider use ...        Select one provider explicitly\n" +
+      "  blue-ice-node provider list           List configured providers\n" +
+      "  blue-ice-node models [--port N]       Query the local OpenAI-compatible API\n" +
+      "  blue-ice-node help                    Show this help\n\n" +
       "Provider keys are loaded by the Python service from the OS keyring or a provider-specific environment variable.\n",
   );
 }
