@@ -21,6 +21,7 @@ Blue Ice Project is an early-stage local proxy that sits between a coding client
 - [Configure providers and credentials](#configure-providers-and-credentials)
 - [Use the TypeScript/Node terminal client](#use-the-typescriptnode-terminal-client)
 - [Connect an agent or OpenAI-compatible client](#connect-an-agent-or-openai-compatible-client)
+- [Agent installation and compatibility guide](docs/agent-integrations.md)
 - [Commands](#commands)
 - [Security-module maturity](#security-module-maturity)
 - [Security, privacy, and operational limits](#security-privacy-and-operational-limits)
@@ -141,6 +142,10 @@ blue-ice provider add vendorx \
 
 `provider add` selects the new provider in local policy. Its HTTPS endpoint URL is stored in the private policy file; the API key remains in the environment or keyring. Custom hosts are checked for public DNS answers, but the address is not pinned to the HTTP connection, so DNS rebinding/TOCTOU remains a residual risk. Use only trusted endpoints.
 
+### How the gateway router selects a provider
+
+Select the active upstream on the Blue Ice service, not separately in each agent. For example, `blue-ice provider use openrouter --model openrouter/auto` routes requests from every local agent through that configured OpenRouter destination. The agent's model ID must be accepted by the active provider. The current router uses one selected upstream at a time; it does not provide per-agent upstream routing, key rotation, cross-provider fallback, or automatic failover. After changing providers, set that provider's key in the service environment or keyring and restart `blue-ice start`.
+
 The example policy [`config.example.yaml`](config.example.yaml) contains no API keys. Defaults include a 2,000,000-byte request limit, an 8,000,000-byte response limit, local auth enabled, registry checks disabled, and LLM Guard disabled. Optional fields include `allowed_domains`, custom providers, audit/token paths, and the project root. Use a private config file; never add credentials to YAML.
 
 ## Use the TypeScript/Node terminal client
@@ -162,38 +167,26 @@ The installed command is `blue-ice-node` so it does not collide with the Python 
 
 ## Connect an agent or OpenAI-compatible client
 
-For a client that supports `OPENAI_BASE_URL` and `OPENAI_API_KEY`, set those to the local endpoint and gateway token in the agent's shell:
+Install the agent using its official instructions in the [detailed agent guide](docs/agent-integrations.md), then point it at `http://127.0.0.1:8080/v1` if it supports a local OpenAI-compatible endpoint. Give the agent the **local Blue Ice token** from `~/.aegis/local-token`; keep the upstream OpenAI/OpenRouter/Groq/Google/Cerebras/custom-provider key in the Blue Ice service environment or OS keyring. Never paste the upstream provider key into an agent configured to call Blue Ice.
+
+For clients that support these environment names, a common local-token setup is:
 
 ```sh
 export OPENAI_BASE_URL='http://127.0.0.1:8080/v1'
 export OPENAI_API_KEY="$(cat "$HOME/.aegis/local-token")"
 ```
 
-Use the client’s documented secret mechanism where possible. If the client asks for a base URL, enter `http://127.0.0.1:8080/v1`; if it asks for an API key, provide the local gateway token, not the upstream provider key. Client variable names differ, so verify its actual configuration and that it sends a bearer token to the proxy.
+Client variable names and authentication behavior differ. Use each agent's documented secret mechanism, and verify that it sends `Authorization: Bearer <local-token>` to the gateway. Run the client on the same machine/network namespace as Blue Ice; a remote agent cannot reach the host's loopback address by default.
 
-### Codex CLI and Codex desktop
+The current documented integration paths are:
 
-The proxy has a native `/v1/responses` route only for the built-in OpenAI provider and custom providers with an explicit native `responses_url`. Codex can be configured to target this route, but Responses SSE is buffered before replay, and no live Codex CLI, desktop, or upstream-account end-to-end test has been completed. Treat the setup as **conditional and unverified**, not full compatibility.
+- **Chat Completions endpoint configuration documented:** Hermes Agent, OpenClaw, Cline, Continue, and Qwen Code. This describes their configuration options; tool calls, streaming, local Bearer-header behavior, or model features can still need verification for the installed version.
+- **Conditional setup:** OpenCode, Kilo Code, Roo Code, Aider, and Goose because important details such as exact route, local-token header handling, streaming, or native tool calls are not established for Blue Ice.
+- **Responses-only and conditional:** Codex CLI and Codex desktop require a native Responses endpoint and compatible streaming, continuation, and tool behavior. Codex Security CLI has separate authentication and configuration and is not verified.
+- **Not directly compatible with the current API:** Claude Code documents the Anthropic Messages protocol; Gemini CLI documents the Gemini API protocol. Blue Ice does not expose those APIs.
+- **Unclear:** Cursor's custom-base-URL path does not establish reliable loopback access or safe local-token forwarding, and its request protocol can vary by model.
 
-A Codex configuration can use the local gateway token through an environment variable:
-
-```toml
-model = "<model-id-supported-by-the-selected-provider>"
-model_provider = "blue-ice"
-
-[model_providers.blue-ice]
-name = "Blue Ice Project"
-base_url = "http://127.0.0.1:8080/v1"
-wire_api = "responses"
-env_key = "BLUE_ICE_LOCAL_TOKEN"
-requires_openai_auth = false
-```
-
-Set `BLUE_ICE_LOCAL_TOKEN` in the environment inherited by Codex. Select a model accepted by the upstream. Keep the provider key only in the proxy process environment or OS keyring. See [the detailed agent integration guide](docs/agent-integrations.md) before relying on this configuration.
-
-**Codex Security CLI is not verified or claimed as supported.** Its isolated configuration and authentication behavior are separate from ordinary Codex CLI, and its documented options do not establish arbitrary local gateway compatibility. This project has not completed a Security scan through Blue Ice Project.
-
-The repository also contains configuration guidance for Hermes Agent, OpenCode, OpenClaw, Cline, Roo Code, Continue, and Cursor. Those examples describe documented client configuration paths and their known caveats; they are not proof of working integrations. Check the [agent integration guide](docs/agent-integrations.md) for details.
+**No end-to-end integration test was completed for any agent in this list.** “Documented” means the client documentation describes a relevant configuration path, not that Blue Ice is certified or tested with that client. The [agent installation and compatibility guide](docs/agent-integrations.md) includes official install links, exact provider/key separation, configuration examples, protocol notes, and verification caveats for 15 clients.
 
 ## Commands
 
