@@ -13,6 +13,7 @@ import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 __all__ = ["inspect_messages", "is_path_within_root"]
 
@@ -51,7 +52,12 @@ _DEFAULT_SENSITIVE_GLOBS = (
     "**/*.p12",
     "*.pfx",
     "**/*.pfx",
+    ".privacyignore",
+    "**/.privacyignore",
+    ".git-credentials*",
+    "**/.git-credentials*",
 )
+_PROTECTED_SYSTEM_ROOTS = ("/boot", "/dev", "/etc", "/proc", "/root", "/run", "/sys")
 
 
 def is_path_within_root(path: str | os.PathLike[str], project_root: str | os.PathLike[str]) -> bool:
@@ -146,6 +152,14 @@ def _matches_sensitive(candidate: str, patterns: list[str], ignore_file: str | N
         canonical = str(Path(candidate).expanduser().resolve(strict=False))
         if ignore_file is not None and canonical == ignore_file:
             return True
+        parts = {part.casefold() for part in Path(canonical).parts}
+        if ".git" in parts:
+            return True
+        if any(
+            canonical == protected or canonical.startswith(protected + os.sep)
+            for protected in _PROTECTED_SYSTEM_ROOTS
+        ):
+            return True
         normalized = candidate.replace("\\", "/").lstrip("./")
         basename = normalized.rsplit("/", 1)[-1]
         for pattern in patterns:
@@ -158,6 +172,23 @@ def _matches_sensitive(candidate: str, patterns: list[str], ignore_file: str | N
         # A sensitive-path evaluation error must not turn into an allow.
         return True
     return False
+
+
+def _decoded_variants(candidate: str) -> Iterable[str]:
+    """Yield the literal path and a small number of URL-decoded forms."""
+    current = candidate
+    yield current
+    for _ in range(2):
+        if "%" not in current:
+            return
+        try:
+            decoded = unquote(current, errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            return
+        if decoded == current:
+            return
+        current = decoded
+        yield current
 
 
 def inspect_messages(
@@ -188,13 +219,15 @@ def inspect_messages(
         for text in _message_strings(message):
             for candidate in _path_candidates(text):
                 code: str | None = None
-                # Windows absolute paths are not valid paths under the host's
-                # project root and are rejected rather than reinterpreted.
-                is_foreign_absolute = bool(re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", candidate))
-                if is_foreign_absolute or not is_path_within_root(candidate, root):
-                    code = "path_outside_project_root"
-                elif _matches_sensitive(candidate, patterns, ignore_file):
-                    code = "sensitive_path_reference"
+                for variant in _decoded_variants(candidate):
+                    # Windows absolute paths are not valid paths under the host's
+                    # project root and are rejected rather than reinterpreted.
+                    is_foreign_absolute = bool(re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", variant))
+                    if is_foreign_absolute or not is_path_within_root(variant, root):
+                        code = "path_outside_project_root"
+                        break
+                    if _matches_sensitive(variant, patterns, ignore_file):
+                        code = "sensitive_path_reference"
                 if code is not None and (message_index, code) not in emitted:
                     emitted.add((message_index, code))
                     findings.append(

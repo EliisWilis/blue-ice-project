@@ -37,6 +37,18 @@ def append_event(
         "response_request",
         "response_blocked",
         "response_error",
+        "anthropic_request",
+        "anthropic_blocked",
+        "anthropic_error",
+        "gemini_request",
+        "gemini_blocked",
+        "gemini_error",
+        "mcp_tool_request",
+        "mcp_tool_blocked",
+        "mcp_tool_error",
+        "a2a_request",
+        "a2a_blocked",
+        "a2a_error",
     }
     safe_outcomes = {"allowed", "blocked", "error"}
     safe_providers = {"openrouter", "groq", "google", "cerebras", "ollama", "none"}
@@ -156,6 +168,18 @@ def read_events(path: Path, limit: int = 50) -> list[dict[str, Any]]:
             "response_request",
             "response_blocked",
             "response_error",
+            "anthropic_request",
+            "anthropic_blocked",
+            "anthropic_error",
+            "gemini_request",
+            "gemini_blocked",
+            "gemini_error",
+            "mcp_tool_request",
+            "mcp_tool_blocked",
+            "mcp_tool_error",
+            "a2a_request",
+            "a2a_blocked",
+            "a2a_error",
         }:
             continue
         outcome = row.get("outcome")

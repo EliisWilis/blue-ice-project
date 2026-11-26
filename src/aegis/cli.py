@@ -18,6 +18,7 @@ from aegis.config import (
     ConfigurationError,
     default_config,
     load_settings,
+    validate_custom_models_provider,
     validate_custom_provider,
     validate_custom_responses_provider,
 )
@@ -194,14 +195,34 @@ def start_command(
 
         from aegis.app import create_app
 
+        card_host = f"[{host}]" if ":" in host else host
         typer.echo(f"Blue Ice Project listening on http://{host}:{port}/v1")
         typer.echo(f"Provider: {settings.provider}; project root: {settings.project_root}")
         uvicorn.run(
-            create_app(settings), host=host, port=port, access_log=False, log_level="warning"
+            create_app(settings, a2a_base_url=f"http://{card_host}:{port}"),
+            host=host,
+            port=port,
+            access_log=False,
+            log_level="warning",
         )
     except ConfigurationError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2)
+
+
+@app.command("mcp")
+def mcp_command(
+    config: Path | None = typer.Option(None, "--config", help="Configuration YAML path"),
+) -> None:
+    """Run the optional read-only MCP project server over stdio."""
+    try:
+        settings = load_settings(config)
+        from aegis.mcp_server import run_stdio
+
+        run_stdio(settings)
+    except (ConfigurationError, RuntimeError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
 
 
 @app.command("audit")
@@ -253,6 +274,9 @@ def provider_add(
     url: str = typer.Option(
         ..., "--url", help="HTTPS OpenAI-compatible /chat/completions endpoint"
     ),
+    models_url: str | None = typer.Option(
+        None, "--models-url", help="Optional HTTPS OpenAI-compatible /models endpoint"
+    ),
     responses_url: str | None = typer.Option(
         None, "--responses-url", help="Optional native HTTPS /responses endpoint"
     ),
@@ -267,6 +291,9 @@ def provider_add(
     try:
         entry_name, endpoint = validate_custom_provider(name, url)
         entry = {"name": entry_name, "url": endpoint}
+        if models_url is not None:
+            _, validated_models_url = validate_custom_models_provider(name, models_url)
+            entry["models_url"] = validated_models_url
         if responses_url is not None:
             _, validated_responses_url = validate_custom_responses_provider(name, responses_url)
             entry["responses_url"] = validated_responses_url
@@ -365,18 +392,23 @@ def main() -> None:
         if command == "provider" and nested:
             subcommand = next((arg for arg in nested if not arg.startswith("-")), "")
             usage = {
-                "add": "Usage: blue-ice provider add NAME --url URL [--responses-url URL] [--model MODEL] [--keyring] [--config PATH]",
+                "add": "Usage: blue-ice provider add NAME --url URL [--models-url URL] [--responses-url URL] [--model MODEL] [--keyring] [--config PATH]",
                 "use": "Usage: blue-ice provider use NAME [--model MODEL] [--config PATH]",
                 "list": "Usage: blue-ice provider list [--config PATH]",
             }.get(subcommand)
             if usage:
                 typer.echo(usage)
                 typer.echo("Provider API keys are never accepted as command-line arguments.")
+                if subcommand == "add":
+                    typer.echo(
+                        "Use an OpenAI Chat Completions-compatible HTTPS endpoint; the /models URL is derived when omitted."
+                    )
                 return
-        if command in {"init", "start", "audit"}:
+        if command in {"init", "start", "mcp", "audit"}:
             usage = {
                 "init": "Usage: blue-ice init [--project-root PATH] [--provider NAME] [--force]",
                 "start": "Usage: blue-ice start [--host LOOPBACK_IP] [--port PORT] [--config PATH]",
+                "mcp": "Usage: blue-ice mcp [--config PATH]",
                 "audit": "Usage: blue-ice audit [--limit 1..500] [--config PATH]",
             }[command]
             typer.echo(usage)
@@ -384,8 +416,9 @@ def main() -> None:
         typer.echo("Blue Ice Project local OpenAI-compatible privacy proxy")
         typer.echo("")
         typer.echo("Commands:")
-        typer.echo("  init      Create private local policy and token files")
+        typer.echo("  init      Create private policy and local token files")
         typer.echo("  start     Start the local API proxy")
+        typer.echo("  mcp       Run the read-only MCP project server over stdio")
         typer.echo("  audit     Show metadata-only audit events")
         typer.echo("  provider  Manage explicitly configured AI providers")
         typer.echo("")

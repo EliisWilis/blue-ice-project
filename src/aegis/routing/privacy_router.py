@@ -215,6 +215,169 @@ async def _validate_custom_responses_endpoint(url: str) -> str:
     return url
 
 
+async def _validate_custom_models_endpoint(url: str) -> str:
+    """Revalidate a configured models endpoint and reject private DNS results."""
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port or 443
+    except (TypeError, ValueError):
+        raise ValueError("custom models endpoint is invalid") from None
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or port != 443
+        or not parsed.path.endswith("/models")
+    ):
+        raise ValueError("custom models endpoint must be an HTTPS /models URL")
+    try:
+        records = await asyncio.to_thread(socket.getaddrinfo, hostname, port, 0, socket.SOCK_STREAM)
+        addresses = {record[4][0] for record in records}
+        if not addresses or any(
+            not ipaddress.ip_address(address).is_global for address in addresses
+        ):
+            raise ValueError("custom models endpoint resolved to a non-public address")
+    except (OSError, ValueError, TypeError):
+        raise ValueError("custom models endpoint DNS validation failed") from None
+    return url
+
+
+async def forward_models(
+    provider: str,
+    api_key: str | None,
+    client: Any,
+    endpoint_url: str | None = None,
+    models_url: str | None = None,
+    max_response_bytes: int = 8_000_000,
+) -> list[dict[str, Any]]:
+    """Return a sanitized model catalog from the one explicitly selected provider."""
+    if type(max_response_bytes) is not int or not 1_024 <= max_response_bytes <= 64_000_000:
+        raise ValueError("max_response_bytes must be between 1024 and 64000000")
+    selected = provider.strip().lower() if isinstance(provider, str) else ""
+    is_custom = endpoint_url is not None
+    if is_custom:
+        if (
+            not selected
+            or len(selected) > 48
+            or not isinstance(endpoint_url, str)
+            or not endpoint_url.endswith("/chat/completions")
+        ):
+            raise ValueError("custom provider name is invalid")
+        derived_url = endpoint_url[: -len("/chat/completions")] + "/models"
+        endpoint = await _validate_custom_models_endpoint(models_url or derived_url)
+    else:
+        selected = _validated_provider(selected)
+        if models_url is not None:
+            raise ValueError("a custom models URL cannot override a built-in provider")
+        if selected == "ollama":
+            endpoint = "http://127.0.0.1:11434/api/tags"
+        else:
+            endpoint = _PROVIDER_URLS[selected][: -len("/chat/completions")] + "/models"
+
+    if selected != "ollama" and (not isinstance(api_key, str) or not api_key.strip()):
+        raise ValueError("api_key is required for the selected cloud provider")
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    raw: bytes
+    try:
+        stream_method = getattr(client, "stream", None)
+        if callable(stream_method):
+            async with stream_method(
+                "GET", endpoint, headers=headers, timeout=_TIMEOUT_SECONDS
+            ) as response:
+                status_code = getattr(response, "status_code", None)
+                if not isinstance(status_code, int) or not 200 <= status_code < 300:
+                    raise ProviderRequestError(
+                        "provider models request returned an unsuccessful HTTP status",
+                        status_code=status_code if isinstance(status_code, int) else None,
+                    )
+                response_headers = getattr(response, "headers", {})
+                response_length = response_headers.get("content-length")
+                if isinstance(response_length, str) and response_length.isdigit():
+                    if int(response_length) > max_response_bytes:
+                        raise ProviderRequestError(
+                            "provider model list exceeded the configured safety limit"
+                        )
+                received = 0
+                chunks: list[bytes] = []
+                async for chunk in response.aiter_bytes():
+                    received += len(chunk)
+                    if received > max_response_bytes:
+                        raise ProviderRequestError(
+                            "provider model list exceeded the configured safety limit"
+                        )
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+        else:
+            response = await client.get(
+                endpoint,
+                headers=headers,
+                timeout=_TIMEOUT_SECONDS,
+                follow_redirects=False,
+            )
+            status_code = getattr(response, "status_code", None)
+            if not isinstance(status_code, int) or not 200 <= status_code < 300:
+                raise ProviderRequestError(
+                    "provider models request returned an unsuccessful HTTP status",
+                    status_code=status_code if isinstance(status_code, int) else None,
+                )
+            content = getattr(response, "content", b"")
+            if not isinstance(content, (bytes, bytearray)) or len(content) > max_response_bytes:
+                raise ProviderRequestError(
+                    "provider model list exceeded the configured safety limit"
+                )
+            raw = bytes(content)
+    except ProviderRequestError:
+        raise
+    except Exception:
+        raise ProviderRequestError("provider model-list request failed") from None
+
+    try:
+        decoded = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError):
+        raise ProviderRequestError("provider returned an invalid model list") from None
+    if not isinstance(decoded, dict):
+        raise ProviderRequestError("provider returned an invalid model list")
+    source = decoded.get("models") if selected == "ollama" else decoded.get("data")
+    if not isinstance(source, list):
+        raise ProviderRequestError("provider returned an unsupported model-list format")
+
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in source[:1000]:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("name" if selected == "ollama" else "id")
+        if (
+            not isinstance(model_id, str)
+            or not model_id.strip()
+            or len(model_id) > 200
+            or any(ord(character) < 32 for character in model_id)
+        ):
+            continue
+        model_id = model_id.strip()
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        model: dict[str, Any] = {"id": model_id, "object": "model"}
+        created = item.get("created")
+        if type(created) is int and created >= 0:
+            model["created"] = created
+        owned_by = item.get("owned_by")
+        if isinstance(owned_by, str) and len(owned_by) <= 128:
+            model["owned_by"] = owned_by
+        result.append(model)
+    if not result:
+        raise ProviderRequestError("provider returned no usable model IDs")
+    return result
+
+
 def _request_body(provider: str, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Copy and validate the body, applying OpenRouter's supported privacy prefs."""
     body = dict(payload)

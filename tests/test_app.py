@@ -42,6 +42,27 @@ class FakeProvider:
         return FakeResponse()
 
 
+class FakeModelResponse:
+    def __init__(self, body: bytes, status_code: int = 200):
+        self.body = body
+        self.status_code = status_code
+        self.headers = {"content-length": str(len(body))}
+
+    async def aiter_bytes(self):
+        yield self.body
+
+
+class FakeModelsProvider:
+    def __init__(self, body: bytes, status_code: int = 200):
+        self.response = FakeModelResponse(body, status_code)
+        self.calls = []
+
+    @asynccontextmanager
+    async def stream(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        yield self.response
+
+
 class FakeResponsesBody:
     status_code = 200
 
@@ -84,6 +105,7 @@ def settings(tmp_path: Path) -> Settings:
         registry_checks=False,
         llm_guard_enabled=False,
         custom_provider_urls=(),
+        custom_models_urls=(),
         custom_responses_urls=(),
     )
 
@@ -98,6 +120,88 @@ async def _responses_request(app, payload, headers=None):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.post("/v1/responses", json=payload, headers=headers or {})
+
+
+async def _models_request(app, headers=None):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.get("/v1/models", headers=headers or {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["chat", "responses", "models"])
+async def test_local_auth_rejects_protected_routes_before_provider(settings, endpoint):
+    token = "local-test-token-with-more-than-32-characters"
+    settings = replace(settings, require_local_auth=True)
+    if endpoint == "responses":
+        settings = replace(settings, provider="openai")
+    settings.token_path.write_text(token, encoding="ascii")
+    settings.token_path.chmod(0o600)
+    provider = FakeProvider() if endpoint != "responses" else FakeResponsesProvider(b"{}")
+    app = create_app(settings, http_client=provider)
+    app.state.http_client = provider
+
+    if endpoint == "chat":
+        response = await _request(
+            app, {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}
+        )
+    elif endpoint == "responses":
+        response = await _responses_request(app, {"model": "test-model", "input": "hello"})
+    else:
+        response = await _models_request(app)
+
+    assert response.status_code == 401
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_remains_public_and_does_not_contact_provider(settings):
+    provider = FakeProvider()
+    app = create_app(settings, http_client=provider)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_models_route_forwards_catalog_with_provider_key_and_sanitizes(settings, monkeypatch):
+    monkeypatch.setenv("AEGIS_GROQ_API_KEY", "groq-model-key")
+    provider = FakeModelsProvider(
+        b'{"object":"list","data":[{"id":"model-a","object":"model",'
+        b'"owned_by":"vendor","api_key":"must-not-pass"},{"id":"model-b"}]}'
+    )
+    app = create_app(settings, http_client=provider)
+    app.state.http_client = provider
+
+    response = await _models_request(app)
+
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()["data"]] == ["model-a", "model-b"]
+    assert "api_key" not in response.text
+    method, url, kwargs = provider.calls[0]
+    assert method == "GET"
+    assert url == "https://api.groq.com/openai/v1/models"
+    assert kwargs["headers"]["Authorization"] == "Bearer groq-model-key"
+
+
+@pytest.mark.asyncio
+async def test_models_route_falls_back_to_configured_model_when_upstream_lacks_catalog(
+    settings, monkeypatch
+):
+    monkeypatch.setenv("AEGIS_GROQ_API_KEY", "groq-model-key")
+    provider = FakeModelsProvider(b"", status_code=404)
+    app = create_app(settings, http_client=provider)
+    app.state.http_client = provider
+
+    response = await _models_request(app)
+
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()["data"]] == ["test-model"]
+    assert response.headers["x-blue-ice-models-source"] == "configured-fallback"
 
 
 @pytest.mark.asyncio
@@ -194,6 +298,56 @@ async def test_firewall_rechecks_output_after_placeholder_reconstruction(setting
     assert response.status_code == 403
     assert response.json()["error"]["type"] == "aegis_policy_block"
     assert "curl_pipe_shell" in response.json()["error"]["rules"]
+
+
+@pytest.mark.asyncio
+async def test_registry_check_with_unavailable_verification_withholds_response(
+    settings, monkeypatch
+):
+    monkeypatch.setenv("AEGIS_GROQ_API_KEY", "groq-test-key")
+    settings = replace(settings, registry_checks=True)
+
+    class PackageSuggestionResponse(FakeResponse):
+        def json(self):
+            value = super().json()
+            value["choices"][0]["message"]["content"] = (
+                "Install with `pip install example-package`."
+            )
+            return value
+
+    provider = FakeProvider()
+
+    async def post(url, **kwargs):
+        provider.calls.append((url, kwargs))
+        return PackageSuggestionResponse()
+
+    async def unavailable_findings(*_args, **_kwargs):
+        return [
+            {
+                "ecosystem": "pypi",
+                "package": "example-package",
+                "reason": "verification_unavailable",
+            }
+        ]
+
+    provider.post = post
+    monkeypatch.setattr(
+        "aegis.app.extract_packages",
+        lambda _text: [{"ecosystem": "pypi", "name": "example-package"}],
+    )
+    monkeypatch.setattr("aegis.app.check_packages", unavailable_findings)
+    app = create_app(settings, http_client=provider)
+    app.state.http_client = provider
+
+    response = await _request(
+        app,
+        {"model": "test-model", "messages": [{"role": "user", "content": "Suggest a package"}]},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["type"] == "aegis_policy_block"
+    assert response.json()["error"]["rules"] == ["package_registry_risk"]
+    assert "example-package" not in response.text
 
 
 @pytest.mark.asyncio
@@ -512,3 +666,103 @@ async def test_provider_error_returns_503_when_audit_write_fails(settings, monke
         response = await _responses_request(app, {"model": "test-model", "input": "hello"})
     assert response.status_code == 503
     assert response.json()["error"]["type"] == "audit_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["chat", "responses"])
+async def test_llm_guard_rejected_input_never_reaches_provider(settings, monkeypatch, endpoint):
+    from aegis.llm_guard_adapter import ScanRejected
+
+    def reject_input(_text, _scanners):
+        raise ScanRejected("synthetic scanner rejection")
+
+    monkeypatch.setattr("aegis.app.scan_input", reject_input)
+    provider = FakeProvider() if endpoint == "chat" else FakeResponsesProvider(b"{}")
+    if endpoint == "responses":
+        settings = replace(settings, provider="openai")
+    settings = replace(settings, llm_guard_enabled=True)
+    app = create_app(
+        settings,
+        http_client=provider,
+        input_scanners=[object()],
+        output_scanners=[object()],
+    )
+
+    if endpoint == "chat":
+        response = await _request(
+            app, {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}
+        )
+    else:
+        response = await _responses_request(app, {"model": "test-model", "input": "hello"})
+
+    assert response.status_code == 403
+    assert response.json()["error"]["type"] == "scanner_rejected"
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_llm_guard_sanitizes_chat_input_and_output_before_return(settings, monkeypatch):
+    monkeypatch.setenv("AEGIS_GROQ_API_KEY", "groq-test-key")
+    calls = {"input": [], "output": []}
+
+    def sanitize_input(text, _scanners):
+        calls["input"].append(text)
+        return text.replace("private-marker", "[MASKED]"), 1
+
+    def sanitize_output(text, prompt, _scanners):
+        calls["output"].append((text, prompt))
+        return text.replace("Returned", "Filtered"), int("Returned" in text)
+
+    monkeypatch.setattr("aegis.app.scan_input", sanitize_input)
+    monkeypatch.setattr("aegis.app.scan_output", sanitize_output)
+    settings = replace(settings, llm_guard_enabled=True)
+    provider = FakeProvider()
+    app = create_app(
+        settings,
+        http_client=provider,
+        input_scanners=[object()],
+        output_scanners=[object()],
+    )
+    app.state.http_client = provider
+
+    response = await _request(
+        app,
+        {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "private-marker"}],
+        },
+    )
+
+    assert response.status_code == 200
+    sent = provider.calls[0][1]["json"]["messages"][0]["content"]
+    assert sent == "[MASKED]"
+    assert "private-marker" not in sent
+    assert response.json()["choices"][0]["message"]["content"] == "Filtered __AEGIS_SEC_001__"
+    assert calls["input"]
+    assert calls["output"]
+    assert all("private-marker" not in prompt for _, prompt in calls["output"])
+
+
+@pytest.mark.asyncio
+async def test_llm_guard_unavailable_fails_closed_before_provider(settings, monkeypatch):
+    from aegis.llm_guard_adapter import ScannerUnavailable
+
+    def unavailable(_text, _scanners):
+        raise ScannerUnavailable("synthetic scanner outage")
+
+    monkeypatch.setattr("aegis.app.scan_input", unavailable)
+    provider = FakeProvider()
+    settings = replace(settings, llm_guard_enabled=True)
+    app = create_app(
+        settings,
+        http_client=provider,
+        input_scanners=[object()],
+        output_scanners=[object()],
+    )
+    response = await _request(
+        app, {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["type"] == "scanner_unavailable"
+    assert provider.calls == []

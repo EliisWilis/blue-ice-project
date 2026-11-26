@@ -133,7 +133,7 @@ def _command_context(tokens: list[str]) -> tuple[str, int] | None:
         return None
     executable = os.path.basename(tokens[0]).lower()
     if executable in {"pip", "pip3"}:
-        return ("pypi", 1) if len(tokens) > 1 and tokens[1] == "install" else None
+        return ("pypi", 2) if len(tokens) > 1 and tokens[1] == "install" else None
     if executable in {"python", "python3", "python3.12"} and len(tokens) >= 4:
         if tokens[1:3] == ["-m", "pip"] and tokens[3] == "install":
             return "pypi", 4
@@ -428,8 +428,9 @@ async def check_packages(text: str, client: Any = None, cache: Any = None) -> li
     creation timestamp under 30 days old. Registry origins are hard-coded; the
     input is never interpreted as a URL, and package installation is never tried.
     ``client`` may be an async HTTP client exposing ``get``. ``cache`` may be a
-    SQLite database path; responses are cached for six hours. Network and malformed
-    API responses fail quiet (no unverifiable finding), with no payload logging.
+    SQLite database path; responses are cached for six hours. Network, malformed
+    API responses, and unexpected checker errors surface as ``verification_unavailable``
+    findings so callers can apply an explicit fail-closed policy. No payload is logged.
     """
     refs = [ref for ref in _extract_refs(text) if ref.ecosystem in {"pypi", "npm"}]
     if not refs:
@@ -443,7 +444,15 @@ async def check_packages(text: str, client: Any = None, cache: Any = None) -> li
 
     results = await asyncio.gather(*(bounded_check(ref) for ref in refs), return_exceptions=True)
     findings: list[dict[str, Any]] = []
-    for result in results:
+    for ref, result in zip(refs, results, strict=True):
         if isinstance(result, dict):
             findings.append(result)
+        elif isinstance(result, Exception):
+            findings.append(
+                {
+                    "ecosystem": ref.ecosystem,
+                    "package": ref.name,
+                    "reason": "verification_unavailable",
+                }
+            )
     return findings

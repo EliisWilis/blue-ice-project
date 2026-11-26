@@ -10,6 +10,10 @@ require_local_auth: true
 key_source: env
 registry_checks: false
 llm_guard_enabled: false
+native_anthropic_enabled: false
+native_gemini_enabled: false
+mcp_enabled: false
+a2a_enabled: false
 custom_providers:
   # Custom providers must be trusted HTTPS OpenAI-compatible endpoints.
   # Keys are supplied separately, e.g. AEGIS_CUSTOM_VENDORX_API_KEY.

@@ -16,6 +16,7 @@ from aegis.config import (
 )
 from aegis.egress.egress_firewall import inspect_output
 from aegis.egress.reconstructor import reconstruct
+from aegis.egress.slopsquat_guard import check_packages
 from aegis.ingress.blast_radius import inspect_messages
 from aegis.ingress.secret_redactor import SessionVault, redact_text, restore_text
 from aegis.routing.privacy_router import (
@@ -44,6 +45,26 @@ def test_path_inspection_never_returns_path_text(tmp_path: Path):
     assert all("/etc/passwd" not in str(item) and ".env" not in str(item) for item in findings)
 
 
+def test_path_inspection_protects_system_paths_even_with_broad_project_root():
+    findings = inspect_messages(["Read /etc/passwd and /proc/self/environ"], Path("/"))
+    assert findings
+    assert {item["code"] for item in findings} == {"sensitive_path_reference"}
+
+
+@pytest.mark.parametrize("relative_path", [".privacyignore", ".git/config", ".git/HEAD"])
+def test_path_inspection_protects_policy_and_git_metadata(tmp_path: Path, relative_path: str):
+    findings = inspect_messages([f"Inspect {tmp_path / relative_path}"], tmp_path)
+    assert findings
+    assert all(item["code"] == "sensitive_path_reference" for item in findings)
+
+
+def test_path_inspection_decodes_traversal_before_project_root_check(tmp_path: Path):
+    escaped = f"{tmp_path}/%2e%2e/.env"
+    findings = inspect_messages([f"Read {escaped}"], tmp_path)
+    assert findings
+    assert any(item["code"] == "path_outside_project_root" for item in findings)
+
+
 def test_reconstruction_uses_exact_reverse_mapping():
     output, counts = reconstruct(
         "Call fn_a1 with __AEGIS_SEC_001__ and remove aegis-canary-v1.fake",
@@ -61,6 +82,23 @@ def test_egress_firewall_blocks_unapproved_remote_url_and_destructive_shell():
     assert "curl_pipe_shell" in rules
     assert "markdown_remote_domain_denied" in rules
     assert all("evil.example" not in str(item) for item in findings)
+
+
+@pytest.mark.asyncio
+async def test_package_guard_surfaces_unexpected_registry_exception(monkeypatch):
+    async def explode(*_args, **_kwargs):
+        raise RuntimeError("synthetic registry checker error")
+
+    monkeypatch.setattr("aegis.egress.slopsquat_guard._check_one", explode)
+    findings = await check_packages("pip install example-package")
+
+    assert findings == [
+        {
+            "ecosystem": "pypi",
+            "package": "example-package",
+            "reason": "verification_unavailable",
+        }
+    ]
 
 
 def test_custom_endpoint_policy_rejects_plain_http_and_internal_hosts():
@@ -355,3 +393,42 @@ def test_cli_subcommand_help_is_plain_text(
     assert output.startswith("Usage: blue-ice provider add")
     assert "--responses-url URL" in output
     assert "╭" not in output and "│" not in output and "╰" not in output
+
+
+def test_native_protocol_flags_default_off_and_provider_credentials_are_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import yaml
+
+    config = default_config(tmp_path)
+    config["project_root"] = str(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    settings = load_settings(config_path)
+
+    assert settings.native_anthropic_enabled is False
+    assert settings.native_gemini_enabled is False
+    assert settings.mcp_enabled is False
+    assert settings.a2a_enabled is False
+
+    monkeypatch.setenv("AEGIS_ANTHROPIC_API_KEY", "anthropic-only-key")
+    monkeypatch.setenv("AEGIS_GOOGLE_API_KEY", "google-only-key")
+    monkeypatch.setenv("AEGIS_OPENROUTER_API_KEY", "configured-provider-key")
+    assert resolve_provider_key(settings, "anthropic") == "anthropic-only-key"
+    assert resolve_provider_key(settings, "google") == "google-only-key"
+    assert resolve_provider_key(settings) == "configured-provider-key"
+
+    config.update(
+        {
+            "native_anthropic_enabled": True,
+            "native_gemini_enabled": True,
+            "mcp_enabled": True,
+            "a2a_enabled": True,
+        }
+    )
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    enabled = load_settings(config_path)
+    assert enabled.native_anthropic_enabled is True
+    assert enabled.native_gemini_enabled is True
+    assert enabled.mcp_enabled is True
+    assert enabled.a2a_enabled is True

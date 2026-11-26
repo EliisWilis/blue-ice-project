@@ -61,7 +61,12 @@ class Settings:
     registry_checks: bool
     llm_guard_enabled: bool
     custom_provider_urls: tuple[tuple[str, str], ...]
+    custom_models_urls: tuple[tuple[str, str], ...]
     custom_responses_urls: tuple[tuple[str, str], ...]
+    native_anthropic_enabled: bool = False
+    native_gemini_enabled: bool = False
+    mcp_enabled: bool = False
+    a2a_enabled: bool = False
 
 
 def default_config(home: Path | None = None) -> dict[str, Any]:
@@ -77,6 +82,10 @@ def default_config(home: Path | None = None) -> dict[str, Any]:
         "key_source": "env",
         "registry_checks": False,
         "llm_guard_enabled": False,
+        "native_anthropic_enabled": False,
+        "native_gemini_enabled": False,
+        "mcp_enabled": False,
+        "a2a_enabled": False,
         "custom_providers": [],
         "audit_path": str(base / ".aegis" / "audit.jsonl"),
         "token_path": str(base / ".aegis" / "local-token"),
@@ -159,6 +168,44 @@ def validate_custom_responses_provider(name: str, url: str) -> tuple[str, str]:
     return name, url
 
 
+def validate_custom_models_provider(name: str, url: str) -> tuple[str, str]:
+    """Validate an explicitly configured OpenAI-compatible models-list endpoint."""
+    if (
+        not isinstance(name, str)
+        or not _PROVIDER_NAME_RE.fullmatch(name)
+        or name in _ALLOWED_PROVIDERS
+    ):
+        raise ConfigurationError("Custom provider name must be a unique lowercase identifier")
+    if not isinstance(url, str) or len(url) > 2048 or any(ord(ch) < 32 for ch in url):
+        raise ConfigurationError("Custom models URL is invalid")
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ConfigurationError("Custom models URL is invalid") from None
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or port not in (None, 443)
+        or not parsed.path.endswith("/models")
+        or hostname.lower() in {"localhost", "localhost.localdomain"}
+        or hostname.lower().endswith((".localhost", ".local", ".internal", ".test"))
+    ):
+        raise ConfigurationError(
+            "Custom models URL must be a public HTTPS /models endpoint without credentials, query, or fragment"
+        )
+    try:
+        hostname.encode("idna")
+    except UnicodeError:
+        raise ConfigurationError("Custom provider host is invalid") from None
+    return name, url
+
+
 def _read_privacyignore(root: Path) -> tuple[str, ...]:
     path = root / ".privacyignore"
     try:
@@ -206,19 +253,24 @@ def load_settings(config_path: str | os.PathLike[str] | None = None) -> Settings
     if not isinstance(custom_raw, list) or len(custom_raw) > 32:
         raise ConfigurationError("custom_providers must be a list of at most 32 endpoints")
     custom: dict[str, str] = {}
+    custom_models: dict[str, str] = {}
     custom_responses: dict[str, str] = {}
     for entry in custom_raw:
-        if not isinstance(entry, dict) or set(entry) not in (
-            {"name", "url"},
-            {"name", "url", "responses_url"},
+        if (
+            not isinstance(entry, dict)
+            or not {"name", "url"}.issubset(entry)
+            or set(entry) - {"name", "url", "models_url", "responses_url"}
         ):
             raise ConfigurationError(
-                "Each custom provider must contain name and url, with optional responses_url"
+                "Each custom provider must contain name and url, with optional models_url and responses_url"
             )
         name, url = validate_custom_provider(entry["name"], entry["url"])
         if name in custom:
             raise ConfigurationError("Custom provider names must be unique")
         custom[name] = url
+        if "models_url" in entry:
+            _, models_url = validate_custom_models_provider(name, entry["models_url"])
+            custom_models[name] = models_url
         if "responses_url" in entry:
             _, responses_url = validate_custom_responses_provider(name, entry["responses_url"])
             custom_responses[name] = responses_url
@@ -240,7 +292,15 @@ def load_settings(config_path: str | os.PathLike[str] | None = None) -> Settings
         raise ConfigurationError("Model must be a non-empty, bounded string")
     if merged["key_source"] not in {"env", "keyring"}:
         raise ConfigurationError("key_source must be env or keyring")
-    for key in ("require_local_auth", "registry_checks", "llm_guard_enabled"):
+    for key in (
+        "require_local_auth",
+        "registry_checks",
+        "llm_guard_enabled",
+        "native_anthropic_enabled",
+        "native_gemini_enabled",
+        "mcp_enabled",
+        "a2a_enabled",
+    ):
         if type(merged[key]) is not bool:
             raise ConfigurationError(f"{key} must be true or false")
     for key in ("max_request_bytes", "max_response_bytes"):
@@ -272,7 +332,12 @@ def load_settings(config_path: str | os.PathLike[str] | None = None) -> Settings
         registry_checks=merged["registry_checks"],
         llm_guard_enabled=merged["llm_guard_enabled"],
         custom_provider_urls=tuple(custom.items()),
+        custom_models_urls=tuple(custom_models.items()),
         custom_responses_urls=tuple(custom_responses.items()),
+        native_anthropic_enabled=merged["native_anthropic_enabled"],
+        native_gemini_enabled=merged["native_gemini_enabled"],
+        mcp_enabled=merged["mcp_enabled"],
+        a2a_enabled=merged["a2a_enabled"],
     )
 
 
@@ -313,9 +378,10 @@ def read_local_token(settings: Settings) -> str | None:
     return token
 
 
-def resolve_provider_key(settings: Settings) -> str | None:
+def resolve_provider_key(settings: Settings, provider: str | None = None) -> str | None:
     """Resolve a key only from the explicitly selected environment/keyring source."""
-    if settings.provider == "ollama":
+    selected_provider = provider or settings.provider
+    if selected_provider == "ollama":
         return None
     if settings.key_source == "env":
         specific = {
@@ -323,16 +389,18 @@ def resolve_provider_key(settings: Settings) -> str | None:
             "openrouter": "AEGIS_OPENROUTER_API_KEY",
             "groq": "AEGIS_GROQ_API_KEY",
             "google": "AEGIS_GOOGLE_API_KEY",
+            "anthropic": "AEGIS_ANTHROPIC_API_KEY",
             "cerebras": "AEGIS_CEREBRAS_API_KEY",
         }.get(
-            settings.provider, f"AEGIS_CUSTOM_{settings.provider.upper().replace('-', '_')}_API_KEY"
+            selected_provider,
+            f"AEGIS_CUSTOM_{selected_provider.upper().replace('-', '_')}_API_KEY",
         )
         value = os.environ.get(specific)
         return value.strip() if isinstance(value, str) and value.strip() else None
     try:
         import keyring
 
-        value = keyring.get_password("aegis-llm-proxy", settings.provider)
+        value = keyring.get_password("aegis-llm-proxy", selected_provider)
         return value if isinstance(value, str) and value.strip() else None
     except Exception:
         return None
