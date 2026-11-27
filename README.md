@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/blue-ice-logo.png" alt="Blue Ice Project logo" width="156" />
+  <img src="assets/blue-ice-logo.png" alt="Blue Ice Project logo" width="176" />
   <h1>Blue Ice Project</h1>
   <p>A local OpenAI-compatible privacy gateway for coding agents</p>
   <p>
