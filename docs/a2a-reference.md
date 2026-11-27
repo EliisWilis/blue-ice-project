@@ -1,11 +1,11 @@
 # A2A reference
 
-Blue Ice menggunakan [repository resmi A2A](https://github.com/a2aproject/A2) sebagai reference protocol untuk kemungkinan delegasi antar-agent. Reference lokal yang dipelajari pada tahap ini dipin pada commit `a506d01`.
+Blue Ice uses the [official A2A repository](https://github.com/a2aproject/A2A) as the protocol reference for possible agent-to-agent delegation. The local reference studied at this stage is pinned to commit `a506d01`.
 
-A2A dan MCP memiliki batas berbeda:
+A2A and MCP have different boundaries:
 
-- MCP menghubungkan model/agent ke tools dan context server.
-- A2A menghubungkan agent ke agent untuk delegasi, task lifecycle, streaming, dan hasil pekerjaan.
-- Responses API tetap menjadi jalur model traffic Codex ke Blue Ice.
+- MCP connects a model or agent to tools and a context server.
+- A2A connects agents for delegation, task lifecycle, streaming, and work results.
+- The Responses API remains the model-traffic path from Codex to Blue Ice.
 
-A2A belum menjadi dependency runtime wajib dan belum ada facade A2A yang aktif di gateway. Implementasi facade harus menunggu kebutuhan delegasi yang jelas serta memiliki authentication, authorization, bounded task state, audit metadata, egress checks, dan contract tests sendiri. Jangan mengklaim dukungan A2A penuh hanya karena repository reference tersedia.
+A2A is not currently a required runtime dependency, and no A2A facade is active in the gateway. Any facade implementation must wait for a clear delegation requirement and have its own authentication, authorization, bounded task state, audit metadata, egress checks, and contract tests. Do not claim full A2A support merely because the reference repository is available.
