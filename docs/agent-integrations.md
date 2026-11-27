@@ -4,6 +4,8 @@ This guide covers 15 commonly requested coding-agent clients. It explains how to
 
 Blue Ice Project is a local gateway at `http://127.0.0.1:8080/v1`. It accepts OpenAI Chat Completions for its supported providers. It has a native `/v1/responses` route only for the built-in OpenAI provider and for a custom provider with an explicitly registered native `responses_url`. It does not translate one protocol into the other. The service binds to loopback only, and Chat/Responses event streams are buffered before replay.
 
+Blue Ice also exposes the selected upstream's model catalog through its authenticated OpenAI-compatible `GET /v1/models` route. The upstream key stays in the Blue Ice process; agents use only the local Blue Ice token. Any agent that actually queries this route can use the returned model IDs, but client behavior varies: some agents query it, while others require model IDs to be added manually in their own configuration. A model appearing in the list does not prove support for tools, streaming, or another native protocol. `blue-ice-node models` is a local way to inspect the same catalog.
+
 ## Keep the two API credentials separate
 
 There are two different credentials:
@@ -36,11 +38,12 @@ blue-ice start
 
 Run the key-entry commands in the same shell that will start the service. Substitute the matching variable for OpenAI, Groq, Google, Cerebras, or a custom provider. Ollama uses a loopback endpoint and does not need a cloud API key. The key is never passed as a CLI argument or saved in policy YAML. The `init` command can offer to store a key in the OS keyring if a secure backend is available.
 
-For a custom HTTPS Chat Completions provider, register its endpoint in local policy and configure the provider-specific key separately:
+For any custom HTTPS provider or gateway that implements OpenAI Chat Completions and Bearer authentication, register its endpoint in local policy and configure the provider-specific key separately. Blue Ice derives the standard `/models` route from the chat endpoint; pass `--models-url` only when the provider uses a different compatible model-list URL:
 
 ```sh
 blue-ice provider add vendorx \
   --url https://api.vendor.example/v1/chat/completions \
+  --models-url https://api.vendor.example/v1/models \
   --model vendor-model
 read -r -s -p "Vendor API key: " AEGIS_CUSTOM_VENDORX_API_KEY
 printf '\n'
@@ -50,7 +53,7 @@ blue-ice start
 
 Add `--responses-url https://api.vendor.example/v1/responses` only if that upstream implements the native Responses API. Blue Ice validates custom-host DNS before use but does not pin the resolved address to the HTTP connection; use only trusted endpoints.
 
-To change the active upstream later, use `blue-ice provider use NAME --model MODEL`, set that provider's key in the service environment (unless it is stored in the OS keyring), and restart the service. `blue-ice provider list` shows configured providers. The model name entered in an agent must be accepted by the active upstream; the agent's model name does not create a new Blue Ice route.
+To change the active upstream later, use `blue-ice provider use NAME --model MODEL`, set that provider's key in the service environment (unless it is stored in the OS keyring), and restart the service. `blue-ice provider list` shows configured providers. When available, upstream model IDs appear through `/v1/models`; if an agent does not query that route, enter a listed ID in its model setting. If the upstream does not implement a model-list route, Blue Ice returns only the configured model. The model name entered in an agent must be accepted by the active upstream; the agent's model name does not create a new Blue Ice route.
 
 ## Standard client connection
 
@@ -89,6 +92,26 @@ Set `BLUE_ICE_TOKEN` in the environment inherited by Codex. Do not put its value
 
 This setup is **conditional and unverified with Blue Ice**. The gateway buffers Responses SSE before replay, while Codex gateway guidance expects compatible streaming, continuation, and tool-call behavior. No live Codex CLI, desktop, or upstream-account test was performed. The CLI's custom-provider screen and the desktop's exact custom-provider UI can vary by version; use the official gateway guide rather than assuming a specific screen path.[2] [3]
 
+Codex can also connect to Blue Ice as an MCP server for tools, independently of its model provider configuration. For local STDIO MCP, add this to the shared Codex configuration:
+
+```toml
+[mcp_servers.blue_ice]
+command = "blue-ice"
+args = ["mcp"]
+enabled = true
+```
+
+If the Blue Ice service is running, use its authenticated Streamable HTTP MCP endpoint instead:
+
+```toml
+[mcp_servers.blue_ice]
+url = "http://127.0.0.1:8080/mcp"
+bearer_token_env_var = "BLUE_ICE_TOKEN"
+enabled = true
+```
+
+Set `BLUE_ICE_TOKEN` to the local Blue Ice token, never to an upstream provider key. The initial tools are read-only capability/model discovery, metadata-only audit reading, skill metadata/content reading, project-path policy checks, and deterministic security checks. MCP does not replace `/v1/responses`, and Blue Ice does not expose arbitrary shell execution through MCP. The MCP server has local contract tests; no specific Codex binary/version is end-to-end verified yet.
+
 ### Codex Security CLI
 
 Install only from the [official Codex Security CLI guide][5]; that guide lists the supported Node.js/Python versions and install methods. Codex Security is a separate application with its own scanner authentication and configuration. It does not automatically inherit the ordinary Codex CLI settings.[6] [7]
@@ -109,7 +132,7 @@ model:
   key_env: BLUE_ICE_TOKEN
 ```
 
-Keep `BLUE_ICE_TOKEN` in the local Hermes environment source (`~/.hermes/.env`) or the process environment, not in a repository. Hermes documents the custom API-key field but does not explicitly establish its exact wire-level Authorization header in every configuration path. Treat Bearer authentication, tool calls, and streaming as **conditional until tested** with your installed Hermes version.[10]
+Set the custom endpoint's Base URL to `http://127.0.0.1:8080/v1` and keep `BLUE_ICE_TOKEN` in the local Hermes environment source (`~/.hermes/.env`) or the process environment, not in a repository. The selected provider's model list is available at the same base URL's `/models` route. If your installed Hermes version queries that route, it can use the returned IDs; if its model flow asks you to define models explicitly, copy an ID from `blue-ice-node models` into the Hermes model configuration. Hermes documents the custom API-key field but does not explicitly establish its exact wire-level Authorization header in every configuration path. Treat Bearer authentication, model discovery, tool calls, and streaming as **conditional until tested** with your installed Hermes version.[10]
 
 ### OpenCode
 
@@ -146,15 +169,15 @@ Set `BLUE_ICE_TOKEN` in OpenClaw's state-directory `.env` or the Gateway process
 
 ### Claude Code
 
-Install Claude Code using Anthropic's [official setup guide][20]. **Claude Code is not directly compatible with the current Blue Ice API.** Claude Code's documented gateway mode uses the Anthropic Messages API at `/v1/messages`; Blue Ice currently exposes OpenAI Chat Completions and selected native OpenAI Responses, not Anthropic Messages.[21] [22]
+Install Claude Code using Anthropic's [official setup guide][20]. Blue Ice now exposes a native-shaped `/v1/messages` adapter. It translates the supported Anthropic text, system, tool-use, and tool-result fields into the selected provider's Chat Completions route, then applies the normal redaction, optional LLM Guard, egress inspection, audit, and buffered SSE replay before returning an Anthropic-shaped response.[21] [22]
 
-Do not point `ANTHROPIC_BASE_URL` directly to Blue Ice and assume it will work. A separate Anthropic-to-OpenAI protocol adapter would be required and is not included or tested in this project. `ANTHROPIC_AUTH_TOKEN` is appropriate only for an Anthropic-format gateway; it is not a way to convert Blue Ice into that protocol.[21] [22]
+Set Claude Code's gateway base URL to the Blue Ice origin and use the local Blue Ice token according to Claude Code's gateway configuration. The adapter is implemented and contract-tested, but no live Claude Code binary or upstream-account test has been run. Advanced Anthropic features outside the mapped subset remain unverified. `ANTHROPIC_AUTH_TOKEN` must contain the local Blue Ice token when Claude Code sends it to the local gateway; never put the upstream provider key in Claude Code.[21] [22]
 
 ### Gemini CLI
 
-Install Gemini CLI using Google's [official install instructions][23]. **Gemini CLI is not directly compatible with the current Blue Ice API.** Its `GOOGLE_GEMINI_BASE_URL` setting is for Gemini API requests, and its documented API key is a Gemini credential. The existence of Google's separate OpenAI-compatible API does not establish that Gemini CLI itself sends OpenAI Chat Completions or accepts Blue Ice's generic Bearer token.[24] [25] [26]
+Install Gemini CLI using Google's [official install instructions][23]. Blue Ice now exposes a native-shaped `POST /v1beta/models/{model}:generateContent` adapter, including buffered SSE replay for stream requests. It translates the mapped Gemini content, system instruction, and generation configuration fields into the selected provider's Chat Completions route and keeps the standard security pipeline.[24] [25] [26]
 
-Do not substitute the Blue Ice local token for `GEMINI_API_KEY`. A Gemini-to-OpenAI protocol adapter and a verified gateway-auth path would be required; neither is included in Blue Ice.
+Configure Gemini CLI's base URL and use the Blue Ice local token only if the installed CLI's authentication mode sends that token as a bearer credential to the configured base URL. The adapter is contract-tested, but no live Gemini CLI binary or upstream-account test has been run. Do not substitute the Blue Ice local token for a provider key when Gemini CLI is configured to call Google's own service rather than the local gateway.[24] [25] [26]
 
 ### Kilo Code
 

@@ -1,12 +1,15 @@
 <div align="center">
-  <img src="assets/blue-ice-logo.png" alt="Blue Ice Project logo" width="108" />
+  <img src="assets/blue-ice-logo.png" alt="Blue Ice Project logo" width="132" />
   <h1>Blue Ice Project</h1>
   <p>A local OpenAI-compatible privacy gateway for coding agents</p>
   <p>
     <img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12 or newer" />
     <img src="https://img.shields.io/badge/Node.js-20%2B-339933?logo=nodedotjs&logoColor=white" alt="Node.js 20 or newer for the TypeScript CLI" />
+    <a href="https://github.com/EliisWilis/blu-ice-project/actions/workflows/ci.yml"><img src="https://github.com/EliisWilis/blu-ice-project/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status" /></a>
     <img src="https://img.shields.io/badge/License-MIT-007EC6" alt="MIT License" />
     <img src="https://img.shields.io/badge/Status-Alpha-orange" alt="Alpha software" />
+    <a href="#offline-demo"><img src="https://img.shields.io/badge/Demo-offline%20run-blue" alt="Run the offline demo" /></a>
+    <a href="https://github.com/EliisWilis/blu-ice-project/stargazers"><img src="https://img.shields.io/github/stars/EliisWilis/blu-ice-project?style=social" alt="GitHub stars" /></a>
   </p>
 </div>
 
@@ -15,8 +18,6 @@ Blue Ice Project is an early-stage local proxy that sits between a coding client
 ## Highlights
 
 - Route OpenAI Chat Completions requests through one explicitly selected provider or trusted custom OpenAI-compatible endpoint.
-- Optionally expose fixed-destination native Anthropic Messages and Gemini GenerateContent adapters without translating their request schemas.
-- Optionally run read-only MCP project tools and an authenticated, text-only A2A JSON-RPC facade through the shared local security pipeline.
 - Keep the upstream provider key in the gateway environment or OS keyring, separate from the local bearer token used by an agent.
 - Discover model IDs through authenticated `/v1/models` when the selected upstream supports a compatible catalog.
 - Apply configurable, bounded request/response checks and metadata-only local audit events; these controls are heuristics, not a sandbox.
@@ -29,13 +30,13 @@ The repository includes a real offline demonstration rather than a hosted AI pla
 - [What it does](#what-it-does)
 - [Tech stack](#tech-stack)
 - [Supported APIs and providers](#supported-apis-and-providers)
+- [Offline demo](#offline-demo)
 - [Quick start](#quick-start)
 - [Configure providers and credentials](#configure-providers-and-credentials)
+- [Model discovery for agents](#model-discovery-for-agents)
 - [Use the TypeScript/Node terminal client](#use-the-typescriptnode-terminal-client)
 - [Connect an agent or OpenAI-compatible client](#connect-an-agent-or-openai-compatible-client)
 - [Agent installation and compatibility guide](docs/agent-integrations.md)
-- [15-agent API compatibility research](docs/agent-api-compatibility-research.md)
-- [README gap analysis](docs/analisis-gap-readme.md)
 - [Commands](#commands)
 - [Security-module maturity](#security-module-maturity)
 - [Security, privacy, and operational limits](#security-privacy-and-operational-limits)
@@ -48,12 +49,13 @@ The service binds to a loopback IP address only (default `127.0.0.1:8080`). It r
 
 For requests that pass policy, the main path can:
 
-- Check recognizable file-path references against the configured project root and `.privacyignore` patterns, including limited URL-encoded traversal checks and selected protected system/Git paths. This is a text-reference filter, not filesystem confinement.
+- Check recognizable file-path references against the configured project root and `.privacyignore` patterns. This is a text-reference filter, not filesystem confinement.
 - Replace recognized secrets with request-scoped placeholders before forwarding, then restore only exact placeholders after response checks. Detection is heuristic and does not guarantee secure erasure.
 - Run the optional LLM Guard adapter when explicitly enabled. It is disabled by default; scanner initialization or runtime failure blocks the request when enabled. The upstream LLM Guard repository is archived.
 - Inspect buffered model output for a limited set of risky shell-command patterns and unapproved Markdown links. This is a heuristic content check, not command-execution control.
 - Optionally query public PyPI/npm registries about package names suggested in response text. This is not an install interceptor and discloses queried package names to those registries.
 - Write bounded, owner-only, metadata-only audit events. Prompts, provider responses, API keys, and reversible secret mappings are not intended to be logged. If an audit write fails, the response is withheld and the API returns an audit error rather than silently treating the event as recorded.
+- Retrieve the selected provider's model catalog through the authenticated local `/v1/models` route when the upstream supports OpenAI-compatible model listing; the API key remains on the proxy side.
 
 Both Chat Completions and Responses payloads are buffered for inspection before delivery. Chat Completions SSE is recreated after checks. Responses SSE is parsed and inspected in full before replay; a terminal completion event is required and events after completion are rejected. This is not incremental streaming and adds latency and memory use.
 
@@ -76,19 +78,34 @@ The project is in **Alpha**. Versions and optional dependencies are declared in 
 | API | Availability | Notes |
 |---|---|---|
 | `GET /healthz` | Local service | Health endpoint; it is unauthenticated and does not disclose a provider key. |
-| `GET /v1/models` | Configured local service | Requires the local bearer token by default; reports models exposed by the selected configuration. |
+| `GET /v1/blue-ice/capabilities` | Authenticated local service | Non-secret discovery document for agent API paths, buffered streaming, tool-call pass-through, and enabled guard controls. |
+| `POST /mcp` | Authenticated local service | Read-only MCP JSON-RPC tools over Streamable HTTP; supports capability, model, audit, skill, and project-policy inspection. |
+| `GET /v1/models` | Configured local service | Requires the local bearer token by default; fetches the selected provider's OpenAI-compatible model catalog. If the provider returns `404`, `405`, or `501`, Blue Ice returns the configured model only and marks the response with `X-Blue-Ice-Models-Source: configured-fallback`. |
 | `POST /v1/chat/completions` | Supported provider routes | OpenAI Chat Completions-compatible requests; provider and model must be configured. |
 | `POST /v1/responses` | Native Responses only | Available for built-in `openai` or a custom provider with an explicitly registered native `responses_url`. Other providers return `501`; no lossy Chat Completions-to-Responses translation is attempted. |
-| `POST /v1/messages` | Optional Anthropic native adapter | Fixed to `api.anthropic.com`; requires `native_anthropic_enabled: true` and `AEGIS_ANTHROPIC_API_KEY`. |
-| `POST /v1beta/models/{model}:generateContent` and `:streamGenerateContent` | Optional Gemini native adapter | Fixed to `generativelanguage.googleapis.com`; requires `native_gemini_enabled: true` and `AEGIS_GOOGLE_API_KEY`. |
-| MCP stdio tools | Optional local project capability server | `blue-ice mcp`; requires `mcp_enabled: true` and the `mcp` extra. Read-only allowlisted tools are confined to the configured project root and `.privacyignore` policy. |
-| A2A Agent Card and JSON-RPC `/a2a` | Optional text-only facade | Requires `a2a_enabled: true`, `a2a-sdk`, and local bearer auth. The Agent Card is served at `/.well-known/agent-card.json`; delegation uses the shared Chat security pipeline. |
+| `POST /v1/messages` | Native-agent adapter | Anthropic Messages-shaped requests are translated to the selected provider's Chat Completions route and replayed as buffered JSON or SSE. |
+| `POST /v1beta/models/{model}:generateContent` | Native-agent adapter | Gemini GenerateContent-shaped requests are translated to Chat Completions and returned as Gemini-shaped JSON or buffered SSE. |
 
 Built-in Chat Completions destinations are **OpenAI, OpenRouter, Groq, Google, Cerebras, and loopback-only Ollama**. Blue Ice is not limited to that list: add any trusted provider or gateway that implements OpenAI Chat Completions with Bearer authentication. Custom providers may supply an explicit `models_url`; otherwise Blue Ice derives `/models` from the configured `/chat/completions` endpoint. Ollama model names are discovered from its local tags API. A custom Responses URL is optional and must be explicitly supplied for an upstream that implements the native Responses API.
 
-Native Anthropic and Gemini adapters now exist behind independent opt-in flags. They forward native JSON requests to fixed official hosts and do not translate schemas, but their SSE is buffered for inspection and replayed only after checks. This is a limited adapter surface, not a claim of complete Claude Code or Gemini CLI compatibility; other provider APIs still need dedicated adapters. See the [agent compatibility guide](docs/agent-integrations.md) for client-specific limits.
+This is a broad compatibility path, not support for every proprietary protocol. Blue Ice now includes bounded Anthropic Messages and Gemini GenerateContent adapters, but the adapters cover the mapped text/tool subset and must still be verified with each installed client version. Other provider-specific APIs still need dedicated adapters. See the [agent compatibility guide](docs/agent-integrations.md) for client-specific limits.
 
 Having an OpenAI-compatible base URL does not prove that a client uses a supported route, authentication header, streaming format, tool-call format, or model feature. Client examples are not certification or end-to-end test results. See [agent integration status](docs/agent-integrations.md).
+
+## Offline demo
+
+Try the local request path without creating an AI-provider account or entering an API key. The fake provider is injected into the app; the demo makes no external network connection and uses only temporary synthetic credentials and responses.
+
+From the repository root:
+
+```sh
+python -m pip install .
+python examples/offline_demo.py
+```
+
+The demo verifies that unauthenticated model-list requests are rejected, an authenticated `GET /v1/models` returns two synthetic IDs, and an authenticated `POST /v1/chat/completions` returns a synthetic completion. It removes its temporary token and audit files when it finishes. This is a runnable local demo, not a live model response or hosted notebook.
+
+[Watch the 5-second Blue Ice Project demo video](docs/assets/blue-ice-launch-demo.mp4) (MP4, 16:9). The moving background is AI-generated; the terminal panel shows output from the actual offline demo run. Provider responses are synthetic, and the video is not a live-provider or security guarantee demonstration.
 
 ## Quick start
 
@@ -129,7 +146,6 @@ Provider keys are loaded from provider-specific environment variables or the OS 
 | OpenRouter | `AEGIS_OPENROUTER_API_KEY` |
 | Groq | `AEGIS_GROQ_API_KEY` |
 | Google | `AEGIS_GOOGLE_API_KEY` |
-| Native Anthropic Messages adapter | `AEGIS_ANTHROPIC_API_KEY` |
 | Cerebras | `AEGIS_CEREBRAS_API_KEY` |
 | Custom provider named `vendorx` | `AEGIS_CUSTOM_VENDORX_API_KEY` |
 | Ollama | No cloud API key; loopback endpoint only |
@@ -149,6 +165,7 @@ Register a custom endpoint only if you control or trust it:
 ```sh
 blue-ice provider add vendorx \
   --url https://api.vendor.example/v1/chat/completions \
+  --models-url https://api.vendor.example/v1/models \
   --model vendor-model
 ```
 
@@ -161,7 +178,7 @@ blue-ice provider add vendorx \
   --model vendor-model
 ```
 
-`provider add` selects the new provider in local policy. Its HTTPS endpoint URL is stored in the private policy file; the API key remains in the environment or keyring. Custom hosts are checked for public DNS answers, but the address is not pinned to the HTTP connection, so DNS rebinding/TOCTOU remains a residual risk. Use only trusted endpoints.
+`--models-url` is optional when the provider uses the matching OpenAI-compatible `/models` route. `provider add` selects the new provider in local policy. Its HTTPS endpoint URLs are stored in the private policy file; the API key remains in the environment or keyring and is never accepted as a command-line argument. Blue Ice sends that upstream key to both configured provider endpoints, so an explicit `--models-url` must be operated by the same provider you trust. Custom hosts are checked for public DNS answers, but the address is not pinned to the HTTP connection, so DNS rebinding/TOCTOU remains a residual risk. Use only trusted endpoints.
 
 ### How the gateway router selects a provider
 
@@ -169,25 +186,43 @@ Select the active upstream on the Blue Ice service, not separately in each agent
 
 The example policy [`config.example.yaml`](config.example.yaml) contains no API keys. Defaults include a 2,000,000-byte request limit, an 8,000,000-byte response limit, local auth enabled, registry checks disabled, and LLM Guard disabled. Optional fields include `allowed_domains`, custom providers, audit/token paths, and the project root. Use a private config file; never add credentials to YAML.
 
-### Enable optional native, MCP, and A2A protocols
-
-Install only the protocol extras you need. `pip install '.[protocols]'` installs both SDKs; `pip install '.[mcp]'` or `pip install '.[a2a]'` installs one. Set the corresponding flags in private `~/.aegis/config.yaml`; all are false in the example config and in default policy. Native adapters accept the local token through the protocol's usual API-key header, but Blue Ice replaces it with the separate upstream credential and does not forward the client's key.
-
-The native adapters use fixed upstream origins and retain the provider JSON contract rather than converting it to OpenAI format. For example, set `native_anthropic_enabled: true` and `AEGIS_ANTHROPIC_API_KEY` for `/v1/messages`, or `native_gemini_enabled: true` and `AEGIS_GOOGLE_API_KEY` for the Gemini GenerateContent paths. Request and response content is buffered for the shared checks. SSE is not incremental; the adapter withholds the complete stream until parsing and inspection finish. These route-level tests use fake upstreams and do not verify compatibility with every model, beta feature, or client release.
-
-The optional MCP server is a separate stdio process: set `mcp_enabled: true`, install the `mcp` extra, and run `blue-ice mcp`. It exposes `list_project_files`, `read_project_file`, and `get_project_policy`; it has no write, shell, or network tool. Directory listing filters `.privacyignore` entries and sanitizes returned names. File reads are bounded, reject symlinks/path traversal and excluded files, redact recognizable secrets, apply egress inspection, and fail closed if enabled LLM Guard cannot scan. Keep stdout reserved for MCP protocol frames.
-
-The A2A facade is optional and requires local auth; `blue-ice start --port N` advertises that same loopback port in the Agent Card. Its JSON-RPC endpoint accepts `text/plain` messages only and delegates through the Chat security pipeline. Streaming and push notifications are disabled, task state is in-memory, and the public Agent Card is not authenticated. This is a limited text facade, not general A2A feature coverage.
-
-### Enable optional LLM Guard
-
-On Python 3.12, install the archived optional dependency with `python -m pip install '.[llm-guard]'`, then set `llm_guard_enabled: true` in the private `~/.aegis/config.yaml` and restart the service. It adds NLP/ML dependencies and may download model resources on first initialization. When enabled, scanner initialization or runtime failures block requests. Read the [setup, verification, and limitations](docs/llm-guard-operations.md) before enabling it; scanning is not a security guarantee.
-
 ### Model discovery for agents
 
 `GET http://127.0.0.1:8080/v1/models` asks the selected upstream for its model catalog using the provider credential held by the Blue Ice service. The local agent only needs the separate Blue Ice token. The `blue-ice-node models` command displays the same result. The list contains model IDs, not capability guarantees; a provider can expose models that do not support every tool, streaming mode, or API route.
 
 An agent that queries the OpenAI-compatible `/v1/models` route may display the upstream model IDs. Some clients—including configurations that require an explicit model list—do not automatically query that route; add the returned model ID in the agent's own provider settings when needed. When an upstream does not implement model listing (`404`, `405`, or `501`), Blue Ice returns only the configured model so existing client setup can still proceed. This does not make every agent's native protocol compatible.
+
+Agents that need to discover the gateway contract can call the authenticated `/v1/blue-ice/capabilities` endpoint. It reports the selected provider and model, API paths, native Responses availability, buffered streaming behavior, tool-call pass-through, and enabled guard controls. It never returns provider credentials, prompts, responses, audit records, or filesystem paths.
+
+### Codex MCP tools
+
+Blue Ice also exposes a read-only MCP server for Codex. MCP is an additional tools channel; it does not replace the model gateway. Codex model traffic still uses the native Responses API at `/v1/responses` when the selected provider supports it.
+
+For a local Codex process, use the STDIO transport:
+
+```toml
+[mcp_servers.blue_ice]
+command = "blue-ice"
+args = ["mcp"]
+enabled = true
+```
+
+When Blue Ice is already running, the authenticated Streamable HTTP transport is available at `http://127.0.0.1:8080/mcp`:
+
+```toml
+[mcp_servers.blue_ice]
+url = "http://127.0.0.1:8080/mcp"
+bearer_token_env_var = "BLUE_ICE_TOKEN"
+enabled = true
+```
+
+Set the local token in the environment without placing it in `config.toml`:
+
+```sh
+export BLUE_ICE_TOKEN="$(cat "$HOME/.aegis/local-token")"
+```
+
+The initial MCP tools are read-only: capability discovery, model listing, metadata-only audit reading, installed-skill listing/reading, project-path policy checks, and deterministic security checks. MCP does not expose arbitrary shell execution, provider credentials, prompts, responses, or secret mappings. The MCP contract is tested locally; no Codex binary version is claimed as end-to-end verified yet.
 
 ## Use the TypeScript/Node terminal client
 
@@ -238,10 +273,10 @@ The Python CLI is `blue-ice`. The TypeScript/Node front end is `blue-ice-node` a
 | `blue-ice --help` | Show available commands in plain text. |
 | `blue-ice init --project-root PATH --provider NAME` | Create private policy and local token files; `--force` replaces policy settings, not an existing key. |
 | `blue-ice start [--host 127.0.0.1] [--port 8080] [--config PATH]` | Start the loopback-only API service. |
-| `blue-ice mcp [--config PATH]` | Run the optional read-only project MCP server over stdio; stdout carries protocol frames. |
+| `blue-ice mcp [--config PATH]` | Serve read-only MCP tools over STDIO for local coding agents. |
 | `blue-ice provider list [--config PATH]` | List built-in and registered provider names without credential data. |
 | `blue-ice provider use NAME [--model MODEL] [--config PATH]` | Select one built-in or registered provider explicitly. |
-| `blue-ice provider add NAME --url URL [--responses-url URL] [--model MODEL] [--keyring]` | Register a trusted HTTPS custom provider; API keys are never command-line arguments. |
+| `blue-ice provider add NAME --url URL [--models-url URL] [--responses-url URL] [--model MODEL] [--keyring]` | Register a trusted HTTPS OpenAI-compatible provider and optional model-catalog URL; API keys are never command-line arguments. |
 | `blue-ice audit [--limit 1..500] [--config PATH]` | Display recent metadata-only audit records; default limit is 50. |
 | `blue-ice-node models [--port N]` | Query and print models exposed by the local `/v1/models` endpoint. |
 
@@ -255,7 +290,7 @@ The project was audited against a 20-module target. **None of the 20 modules is 
 |---:|---|---|---|
 | 1 | PID-bound session proof | Partial | Local bearer auth is on by default; no PID-bound proof or transport. |
 | 2 | RAM-only vault, memory lock, zero-fill | Partial | Request-scoped mappings are cleared; no reliable locked-memory or zeroization guarantee. |
-| 3 | Project path blast-radius sandbox | Partial | Recognized and limited URL-decoded path references are checked; selected system/Git paths are protected. This is not an OS/filesystem sandbox. |
+| 3 | Project path blast-radius sandbox | Partial | Recognized path references are checked; this is not an OS/filesystem sandbox. |
 | 4 | Git history/staged-diff secret guard | Missing | No Git history or index inspection. |
 | 5 | Indirect prompt-injection stripping | Missing | No provenance-aware injection/Unicode sanitizer. |
 | 6 | Secret, PII, and entropy redaction | Partial | Pattern and entropy heuristics with placeholders; detection is incomplete. |
@@ -267,7 +302,7 @@ The project was audited against a 20-module target. **None of the 20 modules is 
 | 12 | Traffic padding and temporal jitter | Missing | No traffic-obfuscation control. |
 | 13 | Hybrid local/cloud prompt splitter | Partial | Optional local summarizer helper is not part of the request pipeline. |
 | 14 | ZDR routing and quota radar | Partial | Direct routing and bounded same-provider retries; no ZDR guarantee, key rotation, cross-provider fallback, or integrated quota radar. |
-| 15 | Hallucinated-package guard | Partial | Optional response-text checks for PyPI/npm; unverifiable checks are withheld when enabled. Does not intercept actual install commands. |
+| 15 | Hallucinated-package guard | Partial | Optional response-text checks for PyPI/npm; does not intercept actual install commands. |
 | 16 | Semantic egress firewall | Partial | Integrated heuristic checks on buffered output; not an execution sandbox. |
 | 17 | Encoded-secret smuggling detector | Missing | No Base64/hex output comparison detector. |
 | 18 | Git snapshot and rollback | Missing | No workspace snapshot/rollback or filesystem write control. |
@@ -309,15 +344,19 @@ The Node package can also be linked locally as `blue-ice-node` with `npm link`. 
 ## Project documentation
 
 - [LLM Guard notes](docs/llm-guard.md)
-- [LLM Guard installation and verification](docs/llm-guard-operations.md)
 - [Security review](docs/security-review.md)
 - [20-module security matrix](docs/security-module-matrix.md)
 - [Agent integration guide](docs/agent-integrations.md)
-- [15-agent API compatibility research](docs/agent-api-compatibility-research.md)
-- [README gap analysis](docs/analisis-gap-readme.md)
-- [Installed agency skills and sources](docs/agency-skills-installed.md)
 - [Codex gateway/protocol research](docs/codex-gateway-research.md)
+- [A2A protocol reference and implementation boundary](docs/a2a-reference.md)
+- [Contributor guide](CONTRIBUTING.md)
+- [Provider setup examples](examples/README.md)
+- [Repository promotion drafts](docs/repository-promotion-drafts.md)
+- [Suggested good-first-issue drafts](docs/issue-ideas.md)
+- [Complete launch playbook](docs/launch-playbook.md)
 - [Example configuration](config.example.yaml)
 - [MIT license](LICENSE)
 
-Blue Ice Project code is MIT licensed. Bundled upstream skills retain their respective licenses and attribution under [`licenses/`](licenses/).
+## License
+
+Blue Ice Project code is released under the [MIT License](LICENSE). Bundled upstream skills retain their respective licenses and attribution under [`licenses/`](licenses/).

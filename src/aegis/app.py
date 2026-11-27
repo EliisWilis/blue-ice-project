@@ -29,9 +29,14 @@ from aegis.llm_guard_adapter import (
     scan_input,
     scan_output,
 )
-from aegis.routing.native_protocols import (
-    forward_anthropic_messages,
-    forward_gemini_generate_content,
+from aegis.mcp_server import handle_request as handle_mcp_request
+from aegis.protocol_adapters import (
+    anthropic_to_chat,
+    chat_to_anthropic,
+    chat_to_anthropic_sse,
+    chat_to_gemini,
+    chat_to_gemini_sse,
+    gemini_to_chat,
 )
 from aegis.routing.privacy_router import (
     ProviderRequestError,
@@ -70,7 +75,11 @@ class RequestSizeLimitMiddleware:
         if (
             scope.get("type") != "http"
             or scope.get("method") != "POST"
-            or not _request_path_has_body_limit(scope.get("path", ""))
+            or not (
+                scope.get("path")
+                in {"/mcp", "/v1/chat/completions", "/v1/responses", "/v1/messages"}
+                or str(scope.get("path", "")).startswith("/v1beta/models/")
+            )
         ):
             await self.app(scope, receive, send)
             return
@@ -137,17 +146,6 @@ class RequestSizeLimitMiddleware:
                 "body": b'{"error":{"type":"request_too_large","message":"Request body exceeds configured size limit"}}',
             }
         )
-
-
-def _request_path_has_body_limit(path: str) -> bool:
-    return (
-        path in {"/v1/chat/completions", "/v1/responses", "/v1/messages"}
-        or path.rstrip("/") == "/a2a"
-        or (
-            path.startswith("/v1beta/models/")
-            and (path.endswith(":generateContent") or path.endswith(":streamGenerateContent"))
-        )
-    )
 
 
 def _transform_strings(value: Any, transform: Any) -> Any:
@@ -382,198 +380,14 @@ def _serialize_response_sse(events: list[dict[str, Any]]) -> bytes:
     return ("\n\n".join(frames) + "\n\n").encode("utf-8")
 
 
-_NATIVE_OUTPUT_METADATA = {
-    "type",
-    "id",
-    "role",
-    "name",
-    "model",
-    "modelVersion",
-    "responseId",
-    "finishReason",
-    "stop_reason",
-    "stop_sequence",
-    "index",
-    "mimeType",
-    "thoughtSignature",
-    "signature",
-    "usage",
-    "usageMetadata",
-    "promptTokenCount",
-    "candidatesTokenCount",
-    "totalTokenCount",
-    "safetyRatings",
-    "citationMetadata",
-    "groundingMetadata",
-}
-
-
-def _native_output_strings(value: Any, protocol: str, active: bool = False) -> list[str]:
-    if isinstance(value, str):
-        return [value] if active else []
-    if isinstance(value, list):
-        return [text for item in value for text in _native_output_strings(item, protocol, active)]
-    if not isinstance(value, dict):
-        return []
-    roots = (
-        {"content", "content_block", "delta", "input"}
-        if protocol == "anthropic"
-        else {"candidates", "promptFeedback"}
-    )
-    found: list[str] = []
-    for child_key, child in value.items():
-        if child_key in _NATIVE_OUTPUT_METADATA:
-            continue
-        if active or child_key in roots:
-            found.extend(_native_output_strings(child, protocol, True))
-    return found
-
-
-def _transform_native_output(
-    value: Any, protocol: str, transform: Any, active: bool = False
-) -> Any:
-    if isinstance(value, str):
-        return transform(value) if active else value
-    if isinstance(value, list):
-        return [_transform_native_output(item, protocol, transform, active) for item in value]
-    if not isinstance(value, dict):
-        return value
-    roots = (
-        {"content", "content_block", "delta", "input"}
-        if protocol == "anthropic"
-        else {"candidates", "promptFeedback"}
-    )
-    return {
-        child_key: (
-            child
-            if child_key in _NATIVE_OUTPUT_METADATA
-            else _transform_native_output(child, protocol, transform, active or child_key in roots)
-        )
-        for child_key, child in value.items()
-    }
-
-
-def _parse_native_sse(raw: bytes, protocol: str) -> list[dict[str, Any]]:
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise ProviderRequestError("provider returned an invalid native SSE stream") from None
-    frames: list[dict[str, Any]] = []
-    for frame_text in re.split(r"\r?\n\r?\n", text):
-        if not frame_text.strip():
-            continue
-        lines = frame_text.splitlines()
-        event_name = ""
-        data_lines: list[str] = []
-        for line in lines:
-            if line.startswith("event:"):
-                event_name = line[6:].strip()
-            elif line.startswith("data:"):
-                data_lines.append(line[5:].lstrip(" "))
-        data: dict[str, Any] | None = None
-        if data_lines:
-            try:
-                decoded = json.loads("\n".join(data_lines))
-            except (UnicodeError, json.JSONDecodeError):
-                raise ProviderRequestError(
-                    "provider returned an invalid native SSE event"
-                ) from None
-            if not isinstance(decoded, dict):
-                raise ProviderRequestError("provider returned an invalid native SSE event")
-            data = decoded
-        if protocol == "anthropic":
-            if event_name == "error" or (data and data.get("type") == "error"):
-                raise ProviderRequestError("Anthropic stream ended with an error event")
-            declared_type = data.get("type") if data else None
-            if event_name and isinstance(declared_type, str) and event_name != declared_type:
-                raise ProviderRequestError("Anthropic stream event type did not match its payload")
-        elif data and data.get("error"):
-            raise ProviderRequestError("Gemini stream ended with an error event")
-        frames.append({"lines": lines, "event": event_name, "data": data})
-
-    if not frames:
-        raise ProviderRequestError("provider returned an empty native SSE stream")
-    if protocol == "anthropic":
-        names = [frame["event"] for frame in frames if frame["event"]]
-        try:
-            start = names.index("message_start")
-            stop = names.index("message_stop")
-        except ValueError:
-            raise ProviderRequestError(
-                "Anthropic stream ended without its message lifecycle"
-            ) from None
-        if start > stop or any(name == "message_stop" for name in names[stop + 1 :]):
-            raise ProviderRequestError("Anthropic stream contained an invalid message lifecycle")
-        if any(name == "message_start" for name in names[start + 1 :]):
-            raise ProviderRequestError("Anthropic stream contained duplicate message starts")
-        if any(
-            frame["event"]
-            and index
-            > next(idx for idx, item in enumerate(frames) if item["event"] == "message_stop")
-            for index, frame in enumerate(frames)
-        ):
-            raise ProviderRequestError("Anthropic stream continued after message_stop")
-    else:
-        has_candidate = any(
-            isinstance(frame.get("data", {}).get("candidates"), list)
-            or isinstance(frame.get("data", {}).get("promptFeedback"), dict)
-            for frame in frames
-            if isinstance(frame.get("data"), dict)
-        )
-        if not has_candidate:
-            raise ProviderRequestError("Gemini stream contained no candidate response")
-    return frames
-
-
-def _serialize_native_sse(frames: list[dict[str, Any]]) -> bytes:
-    serialized: list[str] = []
-    for frame in frames:
-        lines = frame["lines"]
-        data = frame.get("data")
-        if isinstance(data, dict):
-            output_lines: list[str] = []
-            replaced = False
-            for line in lines:
-                if line.startswith("data:"):
-                    if not replaced:
-                        output_lines.append(
-                            "data: " + json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-                        )
-                        replaced = True
-                else:
-                    output_lines.append(line)
-            if not replaced:
-                raise ProviderRequestError("provider returned an invalid native SSE event")
-            lines = output_lines
-        serialized.append("\n".join(lines))
-    return ("\n\n".join(serialized) + "\n\n").encode("utf-8")
-
-
-def _validate_native_response(value: Any, protocol: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ProviderRequestError("provider returned a non-object response")
-    if protocol == "anthropic" and (
-        value.get("type") != "message" or not isinstance(value.get("content"), list)
-    ):
-        raise ProviderRequestError("Anthropic returned an unsupported Messages response")
-    if protocol == "gemini" and not (
-        isinstance(value.get("candidates"), list) or isinstance(value.get("promptFeedback"), dict)
-    ):
-        raise ProviderRequestError("Gemini returned an unsupported GenerateContent response")
-    return value
-
-
 def create_app(
     settings: Settings,
     *,
     http_client: Any | None = None,
     input_scanners: list[Any] | None = None,
     output_scanners: list[Any] | None = None,
-    a2a_base_url: str = "http://127.0.0.1:8080",
 ) -> FastAPI:
     """Create the app. Inject dependencies in tests; production pools HTTPX."""
-    if settings.a2a_enabled and not settings.require_local_auth:
-        raise ValueError("A2A facade requires local bearer authentication")
     local_token = read_local_token(settings)
     if settings.llm_guard_enabled:
         if input_scanners is None or output_scanners is None:
@@ -615,17 +429,11 @@ def create_app(
 
     app.add_middleware(RequestSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
 
-    async def require_local_auth(
-        request: Request, *, protocol: str | None = None
-    ) -> Response | None:
+    async def require_local_auth(request: Request) -> Response | None:
         if not settings.require_local_auth:
             return None
         header = request.headers.get("authorization", "")
         supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
-        if not supplied and protocol == "anthropic":
-            supplied = request.headers.get("x-api-key", "").strip()
-        if not supplied and protocol == "gemini":
-            supplied = request.headers.get("x-goog-api-key", "").strip()
         if not local_token or not supplied or not hmac.compare_digest(supplied, local_token):
             return JSONResponse(
                 status_code=401,
@@ -639,17 +447,113 @@ def create_app(
             )
         return None
 
-    @app.middleware("http")
-    async def authenticate_a2a(request: Request, call_next: Any) -> Response:
-        if settings.a2a_enabled and request.url.path.rstrip("/") == "/a2a":
-            denied = await require_local_auth(request)
-            if denied:
-                return denied
-        return await call_next(request)
-
     @app.get("/healthz")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.post("/mcp")
+    async def mcp(request: Request) -> Response:
+        """Serve the read-only MCP surface over authenticated Streamable HTTP."""
+        denied = await require_local_auth(request)
+        if denied:
+            return denied
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Parse error"},
+                },
+            )
+        if isinstance(payload, list):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Batch requests are not supported"},
+                },
+            )
+
+        async def list_models_for_mcp() -> list[dict[str, Any]]:
+            key = resolve_provider_key(settings)
+            fallback = [{"id": settings.model, "object": "model", "owned_by": "blue-ice-project"}]
+            if settings.provider != "ollama" and not key:
+                return fallback
+            try:
+                return await forward_models(
+                    provider=settings.provider,
+                    api_key=key,
+                    client=request.app.state.http_client,
+                    endpoint_url=dict(settings.custom_provider_urls).get(settings.provider),
+                    models_url=dict(settings.custom_models_urls).get(settings.provider),
+                    max_response_bytes=settings.max_response_bytes,
+                )
+            except (ProviderRequestError, TypeError, ValueError):
+                return fallback
+
+        result = await handle_mcp_request(settings, payload, model_lister=list_models_for_mcp)
+        if result is None:
+            return Response(status_code=202)
+        return JSONResponse(content=result)
+
+    @app.get("/v1/blue-ice/capabilities")
+    async def capabilities(request: Request) -> Response:
+        denied = await require_local_auth(request)
+        if denied:
+            return denied
+        responses_url = dict(settings.custom_responses_urls).get(settings.provider)
+        responses_supported = settings.provider == "openai" or responses_url is not None
+        return JSONResponse(
+            content={
+                "object": "blue_ice.capabilities",
+                "version": "1",
+                "provider": settings.provider,
+                "model": settings.model,
+                "apis": {
+                    "models": {"method": "GET", "path": "/v1/models"},
+                    "chat_completions": {
+                        "method": "POST",
+                        "path": "/v1/chat/completions",
+                        "streaming": "buffered_replay",
+                        "tool_calls": "pass_through_with_egress_inspection",
+                    },
+                    "responses": {
+                        "method": "POST",
+                        "path": "/v1/responses",
+                        "supported": responses_supported,
+                        "streaming": "buffered_replay" if responses_supported else "unsupported",
+                    },
+                    "anthropic_messages": {
+                        "method": "POST",
+                        "path": "/v1/messages",
+                        "supported": True,
+                        "translation": "anthropic_to_chat_completions",
+                        "streaming": "buffered_json_only",
+                    },
+                    "gemini_generate_content": {
+                        "method": "POST",
+                        "path": "/v1beta/models/{model}:generateContent",
+                        "supported": True,
+                        "translation": "gemini_to_chat_completions",
+                        "streaming": "buffered_json_only",
+                    },
+                },
+                "security": {
+                    "local_bearer_auth": settings.require_local_auth,
+                    "llm_guard": {
+                        "enabled": settings.llm_guard_enabled,
+                        "failure_mode": "fail_closed",
+                    },
+                    "secret_redaction": True,
+                    "egress_inspection": True,
+                    "metadata_only_audit": True,
+                },
+            }
+        )
 
     @app.get("/v1/models")
     async def models(request: Request) -> Response:
@@ -959,77 +863,17 @@ def create_app(
             key = None
             vault.clear()
 
-    async def native_endpoint(
-        request: Request,
-        *,
-        protocol: str,
-        model: str | None = None,
-        gemini_stream: bool = False,
-    ) -> Response:
-        denied = await require_local_auth(request, protocol=protocol)
-        if denied:
-            return denied
-        enabled = (
-            settings.native_anthropic_enabled
-            if protocol == "anthropic"
-            else settings.native_gemini_enabled
-        )
-        if not enabled:
-            return JSONResponse(
-                status_code=501,
-                content={
-                    "error": {
-                        "message": f"Native {protocol.title()} adapter is disabled by local policy",
-                        "type": "protocol_adapter_disabled",
-                    }
-                },
+    async def _adapter_chat(payload: dict[str, Any]) -> dict[str, Any]:
+        """Run a translated native-agent request through the chat security path."""
+        messages, _stream = _validate_chat_payload(payload)
+        findings = inspect_messages(messages, settings.project_root, settings.privacyignore_rules)
+        if findings:
+            raise PolicyBlocked(
+                sorted({str(item.get("code", "path_policy_block")) for item in findings})
             )
-
-        started = time.monotonic()
-        audit_prefix = "anthropic" if protocol == "anthropic" else "gemini"
-        provider_name = "anthropic" if protocol == "anthropic" else "google"
         vault = SessionVault(ttl_seconds=180.0)
         redacted_count = 0
-        audit_rules: list[str] = []
-        key: str | None = None
         try:
-            try:
-                payload = await request.json()
-            except Exception:
-                raise ValueError("Request body must be valid JSON") from None
-            if not isinstance(payload, dict):
-                raise ValueError("JSON request body must be an object")
-            if protocol == "anthropic":
-                if not isinstance(payload.get("model"), str) or not payload["model"].strip():
-                    raise ValueError("model must be a non-empty string")
-                if not isinstance(payload.get("messages"), list) or not payload["messages"]:
-                    raise ValueError("messages must be a non-empty array")
-                stream = payload.get("stream", False)
-                if type(stream) is not bool:
-                    raise ValueError("stream must be true or false")
-            else:
-                stream = gemini_stream
-                if "stream" in payload:
-                    raise ValueError("Gemini streaming is selected by the native endpoint path")
-                if not isinstance(payload.get("contents"), list) or not payload["contents"]:
-                    raise ValueError("contents must be a non-empty array")
-                if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", model):
-                    raise ValueError("Gemini model path is invalid")
-
-            inspected_text = "\n".join(_all_strings(payload))
-            path_findings = inspect_messages(
-                [{"role": "user", "content": inspected_text}],
-                settings.project_root,
-                settings.privacyignore_rules,
-            )
-            if path_findings:
-                audit_rules = sorted(
-                    {str(finding.get("code", "path_policy_block")) for finding in path_findings}
-                )
-                raise PolicyBlocked(
-                    audit_rules,
-                    public_message="Request references a path outside the permitted project context",
-                )
 
             def redact(value: str) -> str:
                 nonlocal redacted_count
@@ -1041,265 +885,148 @@ def create_app(
                 return value
 
             clean_payload = _transform_strings(copy.deepcopy(payload), redact)
-            key = resolve_provider_key(settings, provider_name)
-            if not key:
+            clean_payload["stream"] = False
+            key = resolve_provider_key(settings)
+            if settings.provider != "ollama" and not key:
                 raise ProviderRequestError(
-                    f"No API credential is configured for native {protocol.title()}",
-                    status_code=503,
+                    "No API credential is configured for the selected provider"
                 )
-            if protocol == "anthropic":
-                raw_response = await forward_anthropic_messages(
-                    clean_payload,
-                    api_key=key,
-                    client=request.app.state.http_client,
-                    max_response_bytes=settings.max_response_bytes,
-                    client_headers=request.headers,
-                )
-            else:
-                raw_response = await forward_gemini_generate_content(
-                    model or "",
-                    clean_payload,
-                    api_key=key,
-                    client=request.app.state.http_client,
-                    max_response_bytes=settings.max_response_bytes,
-                    stream=stream,
-                )
-
-            if stream:
-                if not isinstance(raw_response, bytes):
-                    raise ProviderRequestError("provider returned an invalid native SSE stream")
-                frames = _parse_native_sse(raw_response, protocol)
-                response_body: dict[str, Any] | None = None
-                output_values = [
-                    text
-                    for frame in frames
-                    for text in _native_output_strings(frame.get("data"), protocol)
-                ]
-            else:
-                if isinstance(raw_response, bytes):
-                    raise ProviderRequestError("provider returned an invalid native response")
-                response_body = _validate_native_response(raw_response, protocol)
-                frames = []
-                output_values = _native_output_strings(response_body, protocol)
-
-            reconstructed_prompt = "\n".join(_all_strings(clean_payload))
+            response = await forward_chat(
+                clean_payload,
+                provider=settings.provider,
+                api_key=key,
+                client=app.state.http_client,
+                endpoint_url=dict(settings.custom_provider_urls).get(settings.provider),
+                max_response_bytes=settings.max_response_bytes,
+            )
+            if not isinstance(response, dict):
+                raise ProviderRequestError("provider returned a non-object response")
+            texts = _assistant_texts(response)
+            prompt = "\n".join(_all_strings(clean_payload.get("messages", [])))
             if settings.llm_guard_enabled:
-                scanned = [
-                    scan_output(text, reconstructed_prompt, output_scanners or [])[0]
-                    for text in output_values
-                ]
+                scanned = [scan_output(text, prompt, output_scanners or [])[0] for text in texts]
                 iterator = iter(scanned)
-
-                def replace_scanned(value: str) -> str:
-                    return next(iterator, value)
-
-                if stream:
-                    for frame in frames:
-                        if isinstance(frame.get("data"), dict):
-                            frame["data"] = _transform_native_output(
-                                frame["data"], protocol, replace_scanned
-                            )
-                else:
-                    response_body = _transform_native_output(
-                        response_body, protocol, replace_scanned
-                    )
-                output_values = (
-                    [
-                        text
-                        for frame in frames
-                        for text in _native_output_strings(frame.get("data"), protocol)
-                    ]
-                    if stream
-                    else _native_output_strings(response_body, protocol)
-                )
-
-            vault_mapping = _collect_vault_mapping(clean_payload, vault)
-            restore_count = sum(
-                text.count(placeholder) for text in output_values for placeholder in vault_mapping
+                response = _replace_assistant_strings(response, lambda value: next(iterator, value))
+            output = "\n".join(_assistant_texts(response))
+            if inspect_output(output, allowed_domains=settings.allowed_domains):
+                raise PolicyBlocked(["egress_policy_block"])
+            mapping = _collect_vault_mapping(clean_payload, vault)
+            response = _replace_assistant_strings(
+                response, lambda value: reconstruct(value, vault=mapping)[0]
             )
-
-            def restore(value: str) -> str:
-                restored, _counts = reconstruct(value, vault=vault_mapping)
-                return restored
-
-            if stream:
-                for frame in frames:
-                    if isinstance(frame.get("data"), dict):
-                        frame["data"] = _transform_native_output(frame["data"], protocol, restore)
-                output_values = [
-                    text
-                    for frame in frames
-                    for text in _native_output_strings(frame.get("data"), protocol)
-                ]
-                serialized = _serialize_native_sse(frames)
-                output_values.extend(
-                    line
-                    for frame in frames
-                    for line in frame["lines"]
-                    if not line.startswith("data:")
-                )
-            else:
-                response_body = _transform_native_output(response_body, protocol, restore)
-                output_values = _native_output_strings(response_body, protocol)
-                serialized = b""
-
-            combined_output = "\n".join(output_values)
-            firewall_findings = inspect_output(
-                combined_output, allowed_domains=settings.allowed_domains
-            )
-            if firewall_findings:
-                audit_rules = sorted({str(item["rule"]) for item in firewall_findings})
-                raise PolicyBlocked(
-                    audit_rules,
-                    public_message="Provider response blocked by Blue Ice Project egress policy",
-                )
-            if settings.registry_checks:
-                found_packages = extract_packages(combined_output)
-                package_findings = await check_packages(
-                    combined_output, client=request.app.state.http_client, cache=None
-                )
-                suspicious = [
-                    item
-                    for item in package_findings
-                    if item.get("reason")
-                    in {"not_found", "recently_created", "verification_unavailable"}
-                ]
-                unknown = [
-                    item for item in found_packages if item["ecosystem"] not in {"pypi", "npm"}
-                ]
-                if suspicious or unknown:
-                    audit_rules = [
-                        "package_registry_risk" if suspicious else "package_registry_unverified"
-                    ]
-                    raise PolicyBlocked(
-                        audit_rules,
-                        public_message="Provider response blocked by package safety policy",
-                    )
-
             await asyncio.to_thread(
                 append_event,
                 settings.audit_path,
-                event=f"{audit_prefix}_request",
+                event="chat_request",
                 outcome="allowed",
-                provider=provider_name,
-                counts={"secrets_redacted": redacted_count, "secrets_restored": restore_count},
-                latency_ms=int((time.monotonic() - started) * 1000),
-            )
-            if stream:
-                return Response(
-                    content=serialized,
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-                )
-            return JSONResponse(content=response_body)
-        except PolicyBlocked as exc:
-            audit_rules = exc.rules
-            await _safe_audit(
-                settings,
-                event=f"{audit_prefix}_blocked",
-                outcome="blocked",
-                provider=provider_name,
+                provider=settings.provider,
                 counts={"secrets_redacted": redacted_count},
-                rules=audit_rules,
-                latency_ms=int((time.monotonic() - started) * 1000),
+                latency_ms=0,
             )
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "error": {
-                        "message": str(exc),
-                        "type": "aegis_policy_block",
-                        "rules": audit_rules,
-                    }
-                },
-            )
-        except (ValueError, ScanRejected) as exc:
-            code = "scanner_rejected" if isinstance(exc, ScanRejected) else "invalid_request"
-            await _safe_audit(
-                settings,
-                event=f"{audit_prefix}_blocked",
-                outcome="blocked",
-                provider=provider_name,
-                counts={"secrets_redacted": redacted_count},
-                rules=[code],
-                latency_ms=int((time.monotonic() - started) * 1000),
-            )
-            return JSONResponse(
-                status_code=400 if code == "invalid_request" else 403,
-                content={"error": {"message": str(exc), "type": code}},
-            )
-        except ScannerUnavailable:
-            await _safe_audit(
-                settings,
-                event=f"{audit_prefix}_blocked",
-                outcome="blocked",
-                provider=provider_name,
-                counts={"secrets_redacted": redacted_count},
-                rules=["scanner_unavailable"],
-                latency_ms=int((time.monotonic() - started) * 1000),
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": {
-                        "message": "Configured scanner is unavailable; request blocked",
-                        "type": "scanner_unavailable",
-                    }
-                },
-            )
-        except ProviderRequestError as exc:
-            await _safe_audit(
-                settings,
-                event=f"{audit_prefix}_error",
-                outcome="error",
-                provider=provider_name,
-                counts={"secrets_redacted": redacted_count},
-                rules=["provider_error"],
-                latency_ms=int((time.monotonic() - started) * 1000),
-            )
-            status = (
-                exc.status_code
-                if exc.status_code and 400 <= exc.status_code < 500
-                else (503 if exc.status_code == 503 else 502)
-            )
-            return JSONResponse(
-                status_code=status,
-                content={"error": {"message": str(exc), "type": "provider_error"}},
-            )
-        except Exception:
-            await _safe_audit(
-                settings,
-                event=f"{audit_prefix}_error",
-                outcome="error",
-                provider=provider_name,
-                counts={"secrets_redacted": redacted_count},
-                rules=["internal_error"],
-                latency_ms=int((time.monotonic() - started) * 1000),
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": {
-                        "message": "Blue Ice Project could not safely complete this request",
-                        "type": "aegis_error",
-                    }
-                },
-            )
+            return response
         finally:
-            key = None
             vault.clear()
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request) -> Response:
-        return await native_endpoint(request, protocol="anthropic")
+        denied = await require_local_auth(request)
+        if denied:
+            return denied
+        try:
+            payload = await request.json()
+            chat_payload = anthropic_to_chat(payload)
+            result = await _adapter_chat(chat_payload)
+            if isinstance(payload, dict) and payload.get("stream") is True:
+                return Response(
+                    content=chat_to_anthropic_sse(result, model=chat_payload["model"]),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+            return JSONResponse(content=chat_to_anthropic(result, model=chat_payload["model"]))
+        except PolicyBlocked as exc:
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"type": "aegis_policy_block", "message": str(exc)}},
+            )
+        except ScannerUnavailable:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "scanner_unavailable",
+                        "message": "Configured scanner is unavailable; request blocked",
+                    }
+                },
+            )
+        except (ValueError, ScanRejected) as exc:
+            return JSONResponse(
+                status_code=400, content={"error": {"type": "invalid_request", "message": str(exc)}}
+            )
+        except ProviderRequestError as exc:
+            return JSONResponse(
+                status_code=502, content={"error": {"type": "provider_error", "message": str(exc)}}
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "aegis_error",
+                        "message": "Blue Ice Project could not safely complete this request",
+                    }
+                },
+            )
 
     @app.post("/v1beta/models/{model}:generateContent")
     async def gemini_generate_content(model: str, request: Request) -> Response:
-        return await native_endpoint(request, protocol="gemini", model=model)
-
-    @app.post("/v1beta/models/{model}:streamGenerateContent")
-    async def gemini_stream_generate_content(model: str, request: Request) -> Response:
-        return await native_endpoint(request, protocol="gemini", model=model, gemini_stream=True)
+        denied = await require_local_auth(request)
+        if denied:
+            return denied
+        try:
+            payload = await request.json()
+            payload["model"] = model
+            chat_payload = gemini_to_chat(payload)
+            result = await _adapter_chat(chat_payload)
+            if isinstance(payload, dict) and payload.get("stream") is True:
+                return Response(
+                    content=chat_to_gemini_sse(result),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+            return JSONResponse(content=chat_to_gemini(result))
+        except PolicyBlocked as exc:
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"type": "aegis_policy_block", "message": str(exc)}},
+            )
+        except ScannerUnavailable:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "scanner_unavailable",
+                        "message": "Configured scanner is unavailable; request blocked",
+                    }
+                },
+            )
+        except (ValueError, ScanRejected) as exc:
+            return JSONResponse(
+                status_code=400, content={"error": {"type": "invalid_request", "message": str(exc)}}
+            )
+        except ProviderRequestError as exc:
+            return JSONResponse(
+                status_code=502, content={"error": {"type": "provider_error", "message": str(exc)}}
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "aegis_error",
+                        "message": "Blue Ice Project could not safely complete this request",
+                    }
+                },
+            )
 
     @app.post("/v1/responses")
     async def responses(request: Request) -> Response:
@@ -1578,167 +1305,6 @@ def create_app(
         finally:
             key = None
             vault.clear()
-
-    if settings.a2a_enabled:
-        try:
-            from a2a.helpers import new_text_message
-            from a2a.server.agent_execution import AgentExecutor
-            from a2a.server.request_handlers import DefaultRequestHandler
-            from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-            from a2a.server.tasks import InMemoryTaskStore
-            from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
-        except ImportError as exc:
-            raise RuntimeError(
-                "A2A support requires the optional dependency group: pip install 'blue-ice-project[a2a]'"
-            ) from exc
-
-        class A2AInvocationError(RuntimeError):
-            pass
-
-        async def invoke_a2a_text(text: str, context_id: str | None, task_id: str | None) -> str:
-            if len(text.encode("utf-8")) > settings.max_request_bytes:
-                raise A2AInvocationError("A2A text input exceeds the configured request limit")
-            body = json.dumps(
-                {
-                    "model": settings.model,
-                    "messages": [{"role": "user", "content": text}],
-                    "stream": False,
-                },
-                separators=(",", ":"),
-            ).encode("utf-8")
-            headers = [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode("ascii")),
-            ]
-            if local_token:
-                headers.append((b"authorization", f"Bearer {local_token}".encode("ascii")))
-            scope = {
-                "type": "http",
-                "asgi": {"version": "3.0", "spec_version": "2.3"},
-                "http_version": "1.1",
-                "method": "POST",
-                "scheme": "http",
-                "path": "/v1/chat/completions",
-                "raw_path": b"/v1/chat/completions",
-                "query_string": b"",
-                "headers": headers,
-                "server": ("127.0.0.1", 8080),
-                "client": ("127.0.0.1", 0),
-                "root_path": "",
-                "app": app,
-            }
-            sent = False
-
-            async def receive() -> dict[str, Any]:
-                nonlocal sent
-                if sent:
-                    return {"type": "http.disconnect"}
-                sent = True
-                return {"type": "http.request", "body": body, "more_body": False}
-
-            internal_request = Request(scope, receive)
-            result = await chat_completions(internal_request)
-            if result.status_code != 200 or not isinstance(result, JSONResponse):
-                outcome = "blocked" if result.status_code in {400, 403} else "error"
-                await asyncio.to_thread(
-                    append_event,
-                    settings.audit_path,
-                    event="a2a_blocked" if outcome == "blocked" else "a2a_error",
-                    outcome=outcome,
-                    provider=settings.provider,
-                    rules=[
-                        "delegated_request_blocked"
-                        if outcome == "blocked"
-                        else "delegated_request_error"
-                    ],
-                )
-                raise A2AInvocationError(
-                    "Delegated request was blocked by policy"
-                    if outcome == "blocked"
-                    else "Delegated request could not be safely completed"
-                )
-            try:
-                response_body = json.loads(result.body)
-                message = response_body["choices"][0]["message"]
-                content = message.get("content")
-                if isinstance(content, str):
-                    answer = content
-                elif isinstance(content, list):
-                    answer = "\n".join(
-                        item["text"]
-                        for item in content
-                        if isinstance(item, dict) and isinstance(item.get("text"), str)
-                    )
-                else:
-                    raise ValueError
-            except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
-                raise A2AInvocationError("Gateway returned an unsupported text response") from None
-            await asyncio.to_thread(
-                append_event,
-                settings.audit_path,
-                event="a2a_request",
-                outcome="allowed",
-                provider=settings.provider,
-            )
-            return answer
-
-        class BlueIceA2AExecutor(AgentExecutor):
-            async def execute(self, context: Any, event_queue: Any) -> None:
-                message = context.message
-                if message is None or not message.parts:
-                    raise A2AInvocationError("A2A requires at least one text part")
-                if any(not part.HasField("text") for part in message.parts):
-                    raise A2AInvocationError("A2A facade accepts text/plain parts only")
-                text = context.get_user_input()
-                if not text.strip():
-                    raise A2AInvocationError("A2A text input must not be empty")
-                answer = await invoke_a2a_text(text, context.context_id, context.task_id)
-                await event_queue.enqueue_event(
-                    new_text_message(
-                        answer,
-                        media_type="text/plain",
-                        context_id=context.context_id,
-                        task_id=context.task_id,
-                    )
-                )
-
-            async def cancel(self, context: Any, event_queue: Any) -> None:
-                raise A2AInvocationError("A2A facade does not create long-running tasks")
-
-        base_url = a2a_base_url.rstrip("/")
-        public_card = AgentCard(
-            name="Blue Ice Project",
-            description="Text-only delegation through the local Blue Ice security pipeline.",
-            version="0.1.0",
-            default_input_modes=["text/plain"],
-            default_output_modes=["text/plain"],
-            capabilities=AgentCapabilities(streaming=False, push_notifications=False),
-            supported_interfaces=[
-                AgentInterface(
-                    protocol_binding="JSONRPC",
-                    url=f"{base_url}/a2a",
-                    protocol_version="1.0",
-                )
-            ],
-            skills=[
-                AgentSkill(
-                    id="secure-text-delegation",
-                    name="Secure text delegation",
-                    description="Delegates a text prompt through the configured Blue Ice model and security checks.",
-                    tags=["privacy", "coding-assistant"],
-                    examples=["Explain this error message"],
-                    input_modes=["text/plain"],
-                    output_modes=["text/plain"],
-                )
-            ],
-        )
-        request_handler = DefaultRequestHandler(
-            agent_executor=BlueIceA2AExecutor(),
-            task_store=InMemoryTaskStore(),
-            agent_card=public_card,
-        )
-        app.router.routes.extend(create_agent_card_routes(public_card))
-        app.router.routes.extend(create_jsonrpc_routes(request_handler, "/a2a"))
 
     return app
 
