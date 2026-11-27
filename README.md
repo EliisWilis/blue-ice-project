@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/blue-ice-logo.png" alt="Blue Ice Project logo" width="132" />
+  <img src="assets/blue-ice-logo.png" alt="Blue Ice Project logo" width="156" />
   <h1>Blue Ice Project</h1>
   <p>A local OpenAI-compatible privacy gateway for coding agents</p>
   <p>
@@ -32,10 +32,13 @@ The repository includes a real offline demonstration rather than a hosted AI pla
 - [Supported APIs and providers](#supported-apis-and-providers)
 - [Offline demo](#offline-demo)
 - [Quick start](#quick-start)
+- [Install on Linux, macOS, and Windows](#install-on-linux-macos-and-windows)
 - [Configure providers and credentials](#configure-providers-and-credentials)
 - [Model discovery for agents](#model-discovery-for-agents)
 - [Use the TypeScript/Node terminal client](#use-the-typescriptnode-terminal-client)
 - [Connect an agent or OpenAI-compatible client](#connect-an-agent-or-openai-compatible-client)
+- [Agent connection matrix](#agent-connection-matrix)
+- [Troubleshooting](#troubleshooting)
 - [Agent installation and compatibility guide](docs/agent-integrations.md)
 - [Commands](#commands)
 - [Security-module maturity](#security-module-maturity)
@@ -135,6 +138,97 @@ blue-ice start
 Keep this process running. The service listens at `http://127.0.0.1:8080` by default. In a separate terminal, configure your client to use `http://127.0.0.1:8080/v1` and the local token in `~/.aegis/local-token`. The local token authenticates to Blue Ice Project; it is not the provider's API key.
 
 The `init` command can offer to store a provider key in an available OS keyring. Use that option only if the selected system keyring has a secure, working backend. The Python CLI also supports `blue-ice start --port 8081` and `blue-ice start --config /path/to/private-config.yaml`. It refuses non-loopback bind addresses.
+
+## Install on Linux, macOS, and Windows
+
+Blue Ice is a local Python application. The gateway itself works on Linux, macOS, Windows, and Windows Subsystem for Linux (WSL) as long as Python 3.12 or newer is available. Use a virtual environment so the gateway and its dependencies remain isolated from the operating system.
+
+### Linux
+
+Install Python and the repository with your distribution's package manager, then create the virtual environment:
+
+```sh
+# Debian/Ubuntu example; use the equivalent packages for your distribution.
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv python3-pip git
+git clone https://github.com/EliisWilis/blue-ice-project.git
+cd blue-ice-project
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install .
+```
+
+### macOS
+
+Install Python with [Homebrew](https://brew.sh/) or use the official Python installer. Homebrew users can run:
+
+```sh
+brew install python@3.12 git
+git clone https://github.com/EliisWilis/blue-ice-project.git
+cd blue-ice-project
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install .
+```
+
+### Windows PowerShell
+
+Install Python 3.12+ from [python.org](https://www.python.org/downloads/windows/) or the Microsoft Store, and install Git from [git-scm.com](https://git-scm.com/download/win). In PowerShell:
+
+```powershell
+git clone https://github.com/EliisWilis/blue-ice-project.git
+Set-Location blue-ice-project
+py -3.12 -m venv .venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install .
+```
+
+If PowerShell activation is restricted by local policy, invoke the environment directly instead of changing a permanent policy:
+
+```powershell
+.\.venv\Scripts\blue-ice.exe --help
+```
+
+Windows stores the local token and policy under the current user's home directory. Keep the default loopback binding; do not use `--host 0.0.0.0` or expose the service through a public firewall rule. WSL users should follow the Linux commands inside WSL and run the coding agent in the same WSL/network namespace when using `127.0.0.1`.
+
+### Initialize and start on any OS
+
+After installation, use an absolute project path. The project directory is the policy boundary used by path checks; it does not grant Blue Ice filesystem sandboxing:
+
+```sh
+blue-ice init --project-root /absolute/path/to/your/project --provider openrouter
+blue-ice provider use openrouter --model openrouter/auto
+blue-ice start
+```
+
+On Windows PowerShell, use a Windows path:
+
+```powershell
+blue-ice init --project-root 'C:\Users\you\src\my-project' --provider openrouter
+blue-ice provider use openrouter --model openrouter/auto
+blue-ice start
+```
+
+Keep the terminal running. The local service is available at `http://127.0.0.1:8080`; health can be checked at `http://127.0.0.1:8080/healthz`. The default local token is at `~/.aegis/local-token` on Unix-like systems and under the equivalent user home directory on Windows. Do not commit that token, generated policy, or audit files.
+
+### Upgrade or uninstall
+
+From an activated virtual environment, update the checkout and reinstall the package:
+
+```sh
+git pull --ff-only
+python -m pip install --upgrade .
+```
+
+To remove the application, delete the checkout and `.venv`. Remove `~/.aegis/` only after backing up or intentionally deleting its local token, policy, and audit files. Python package uninstall is optional because the virtual environment can be deleted as a unit:
+
+```sh
+python -m pip uninstall blue-ice-project
+```
 
 ## Configure providers and credentials
 
@@ -262,7 +356,57 @@ The current documented integration paths are:
 - **Not directly compatible with the current API:** Claude Code documents the Anthropic Messages protocol; Gemini CLI documents the Gemini API protocol. Blue Ice does not expose those APIs.
 - **Unclear:** Cursor's custom-base-URL path does not establish reliable loopback access or safe local-token forwarding, and its request protocol can vary by model.
 
+### Agent connection matrix
+
+Use the official installation method for the agent, then apply the connection pattern below. The gateway URL is the same on Linux, macOS, Windows, and WSL; only the shell syntax for setting environment variables changes. The token in every row is the **local Blue Ice token**, never an upstream provider key.
+
+| Agent | Connection pattern | Current status | Notes |
+|---|---|---|---|
+| Codex CLI / Codex desktop | Native Responses at `/v1/responses` plus MCP at `/mcp` | Conditional | Use the MCP STDIO or authenticated HTTP setup above. The provider must expose native Responses; model traffic and MCP tools are separate. |
+| Hermes Agent | OpenAI Chat Completions at `/v1` | Documented, untested | Configure the custom base URL and local token according to the agent guide. |
+| OpenCode | OpenAI-compatible provider at `/v1` | Conditional | Verify the exact request path and Bearer header for the installed adapter. |
+| OpenClaw | `openai-completions` provider at `/v1` | Documented, untested | Keep the token in its environment or secret file, not in a shared project config. |
+| Claude Code | Anthropic-shaped `/v1/messages` adapter | Implemented, untested | Only the mapped text/tool subset is covered; configure the local token as its gateway credential. |
+| Gemini CLI | Gemini-shaped `generateContent` adapter | Implemented, untested | Verify that the CLI sends the local token to the configured gateway rather than to Google directly. |
+| Kilo Code | OpenAI Compatible provider at `/v1` | Conditional | Confirm Bearer authentication, streaming, and tool-call behavior. |
+| Cline | OpenAI Compatible provider at `/v1` | Documented, untested | Store the token in user-level settings or an environment-backed secret. |
+| Roo Code | OpenAI Compatible provider at `/v1` | Conditional | Native tool calling and the selected protocol still require client-version testing. |
+| Continue | OpenAI provider at `/v1` | Documented, untested | Set `useResponsesApi: false` unless a native Responses provider is configured. |
+| Cursor | Custom base URL | Unclear | Do not place the local token in a cloud BYOK field unless the client documents local forwarding. |
+| Aider | `OPENAI_BASE_URL` and `OPENAI_API_KEY` | Conditional | Use the local token for `OPENAI_API_KEY`; keep `.env` files outside the repository. |
+| Goose | OpenAI Compatible custom provider | Conditional | Use its local credential store and verify the emitted Authorization header. |
+| Qwen Code | OpenAI provider at `/v1` | Documented, untested | Keep the local token in its user-level environment configuration. |
+| Codex Security CLI | Separate security application | Not verified | It has separate scanner authentication and configuration; ordinary Codex setup is not proof of support. |
+
+For exact install links, config files, credential locations, protocol details, and per-client caveats, use the [agent installation and compatibility guide](docs/agent-integrations.md). A client can be installed successfully and still fail against Blue Ice because of a route, protocol, model, streaming, or authentication mismatch.
+
 **No end-to-end integration test was completed for any agent in this list.** “Documented” means the client documentation describes a relevant configuration path, not that Blue Ice is certified or tested with that client. The [agent installation and compatibility guide](docs/agent-integrations.md) includes official install links, exact provider/key separation, configuration examples, protocol notes, and verification caveats for 15 clients.
+
+## Troubleshooting
+
+### `401 unauthorized` or the agent cannot connect
+
+Confirm that Blue Ice is running, the client uses `http://127.0.0.1:8080/v1`, and the client sends `Authorization: Bearer <local-token>`. Read the token from `~/.aegis/local-token` (or the equivalent Windows user-home path) and do not substitute the upstream provider key. For MCP HTTP, set `BLUE_ICE_TOKEN` and use `/mcp`, not `/v1/mcp`.
+
+### `501` from `/v1/responses`
+
+The selected provider does not have a registered native Responses endpoint. Use Chat Completions with an agent that supports it, select the built-in `openai` provider, or register a trusted custom provider with `--responses-url`. Blue Ice intentionally does not perform a lossy protocol translation.
+
+### The model list is empty or missing the expected model
+
+Run `blue-ice provider list`, confirm the active provider and model with `blue-ice provider use`, and call the authenticated `/v1/models` route. If the upstream does not implement `/models`, Blue Ice returns the configured model as a fallback. A listed model is not a guarantee that the model supports tools, streaming, or Responses.
+
+### MCP STDIO starts and immediately exits
+
+Run `blue-ice mcp --help` from the same virtual environment used by the agent, then test the command manually with a temporary configuration. For a desktop agent, use the absolute path to the executable when its environment does not inherit the activated shell. STDIO is a protocol process: do not start it as a background HTTP server and do not write diagnostic text to its standard output.
+
+### MCP HTTP returns `404`, `413`, or `500`
+
+Use `POST http://127.0.0.1:8080/mcp` with the local bearer token. `413` means the bounded request-size policy rejected the payload. Check the service terminal and metadata-only audit output for sanitized diagnostics; provider credentials, prompts, responses, and secret mappings are intentionally not logged.
+
+### The provider request is blocked
+
+Review the project root, `.privacyignore`, configured allowed domains, request/response size limits, egress policy, and optional LLM Guard state. When LLM Guard is enabled, scanner initialization or runtime failure blocks requests by design. Do not disable security controls merely to make an unverified client appear compatible.
 
 ## Commands
 
