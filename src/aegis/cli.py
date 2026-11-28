@@ -195,15 +195,10 @@ def start_command(
 
         from aegis.app import create_app
 
-        card_host = f"[{host}]" if ":" in host else host
         typer.echo(f"Blue Ice Project listening on http://{host}:{port}/v1")
         typer.echo(f"Provider: {settings.provider}; project root: {settings.project_root}")
         uvicorn.run(
-            create_app(settings, a2a_base_url=f"http://{card_host}:{port}"),
-            host=host,
-            port=port,
-            access_log=False,
-            log_level="warning",
+            create_app(settings), host=host, port=port, access_log=False, log_level="warning"
         )
     except ConfigurationError as exc:
         typer.echo(str(exc), err=True)
@@ -214,15 +209,17 @@ def start_command(
 def mcp_command(
     config: Path | None = typer.Option(None, "--config", help="Configuration YAML path"),
 ) -> None:
-    """Run the optional read-only MCP project server over stdio."""
+    """Serve the read-only MCP endpoint over STDIO for local coding agents."""
     try:
         settings = load_settings(config)
-        from aegis.mcp_server import run_stdio
+        import asyncio
 
-        run_stdio(settings)
-    except (ConfigurationError, RuntimeError, OSError) as exc:
+        from aegis.mcp_server import serve_stdio
+
+        asyncio.run(serve_stdio(settings))
+    except ConfigurationError as exc:
         typer.echo(str(exc), err=True)
-        raise typer.Exit(2) from None
+        raise typer.Exit(2)
 
 
 @app.command("audit")
@@ -416,9 +413,9 @@ def main() -> None:
         typer.echo("Blue Ice Project local OpenAI-compatible privacy proxy")
         typer.echo("")
         typer.echo("Commands:")
-        typer.echo("  init      Create private policy and local token files")
+        typer.echo("  init      Create private local policy and token files")
         typer.echo("  start     Start the local API proxy")
-        typer.echo("  mcp       Run the read-only MCP project server over stdio")
+        typer.echo("  mcp       Serve read-only MCP tools over STDIO")
         typer.echo("  audit     Show metadata-only audit events")
         typer.echo("  provider  Manage explicitly configured AI providers")
         typer.echo("")
