@@ -11,6 +11,9 @@
     <a href="#offline-demo"><img src="https://img.shields.io/badge/Demo-offline%20run-blue" alt="Run the offline demo" /></a>
     <a href="https://github.com/EliisWilis/blu-ice-project/stargazers"><img src="https://img.shields.io/github/stars/EliisWilis/blu-ice-project?style=social" alt="GitHub stars" /></a>
   </p>
+  <p>
+    <a href="https://m8ven.ai/mcp/eliiswilis-blue-ice-project-mgg3ka?s=readme"><img src="https://m8ven.ai/badge/mcp/eliiswilis-blue-ice-project-mgg3ka?v=dc2b4bceaed7038aa3650b36f05f168c" alt="M8ven Score" /></a>
+  </p>
 </div>
 
 Blue Ice Project is an early-stage local proxy that sits between a coding client and one explicitly selected AI provider. It offers bounded, configurable checks for requests and responses. It is defense in depth, not a complete security boundary, sandbox, certified gateway, or guarantee of confidentiality or zero data retention.
