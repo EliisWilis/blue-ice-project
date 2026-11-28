@@ -197,8 +197,13 @@ def start_command(
 
         typer.echo(f"Blue Ice Project listening on http://{host}:{port}/v1")
         typer.echo(f"Provider: {settings.provider}; project root: {settings.project_root}")
+        display_host = f"[{host}]" if ":" in host else host
         uvicorn.run(
-            create_app(settings), host=host, port=port, access_log=False, log_level="warning"
+            create_app(settings, a2a_base_url=f"http://{display_host}:{port}/a2a"),
+            host=host,
+            port=port,
+            access_log=False,
+            log_level="warning",
         )
     except ConfigurationError as exc:
         typer.echo(str(exc), err=True)

@@ -9,7 +9,7 @@
     <img src="https://img.shields.io/badge/License-MIT-007EC6" alt="MIT License" />
     <img src="https://img.shields.io/badge/Status-Alpha-orange" alt="Alpha software" />
     <a href="#offline-demo"><img src="https://img.shields.io/badge/Demo-offline%20run-blue" alt="Run the offline demo" /></a>
-    <a href="https://github.com/EliisWilis/blu-ice-project/stargazers"><img src="https://img.shields.io/github/stars/EliisWilis/blu-ice-project?style=flat" alt="GitHub stars" /></a>
+    <a href="https://github.com/EliisWilis/blu-ice-project/stargazers"><img src="https://img.shields.io/github/stars/EliisWilis/blu-ice-project?style=flat&amp;cacheSeconds=300" alt="GitHub stars" /></a>
   </p>
   <p>
     <a href="https://m8ven.ai/mcp/eliiswilis-blue-ice-project-mgg3ka?s=readme"><img src="https://m8ven.ai/badge/mcp/eliiswilis-blue-ice-project-mgg3ka?v=dc2b4bceaed7038aa3650b36f05f168c" alt="M8ven Score" /></a>

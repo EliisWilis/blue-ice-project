@@ -38,6 +38,10 @@ from aegis.protocol_adapters import (
     chat_to_gemini_sse,
     gemini_to_chat,
 )
+from aegis.routing.native_protocols import (
+    forward_anthropic_messages,
+    forward_gemini_generate_content,
+)
 from aegis.routing.privacy_router import (
     ProviderRequestError,
     forward_chat,
@@ -386,6 +390,7 @@ def create_app(
     http_client: Any | None = None,
     input_scanners: list[Any] | None = None,
     output_scanners: list[Any] | None = None,
+    a2a_base_url: str | None = None,
 ) -> FastAPI:
     """Create the app. Inject dependencies in tests; production pools HTTPX."""
     local_token = read_local_token(settings)
@@ -429,11 +434,18 @@ def create_app(
 
     app.add_middleware(RequestSizeLimitMiddleware, max_bytes=settings.max_request_bytes)
 
-    async def require_local_auth(request: Request) -> Response | None:
+    async def require_local_auth(
+        request: Request, header_names: tuple[str, ...] = ("authorization",)
+    ) -> Response | None:
         if not settings.require_local_auth:
             return None
         header = request.headers.get("authorization", "")
         supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        for header_name in header_names:
+            candidate = request.headers.get(header_name, "").strip()
+            if candidate and header_name != "authorization":
+                supplied = candidate
+                break
         if not local_token or not supplied or not hmac.compare_digest(supplied, local_token):
             return JSONResponse(
                 status_code=401,
@@ -446,6 +458,87 @@ def create_app(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         return None
+
+    @app.get("/.well-known/agent-card.json")
+    async def a2a_agent_card() -> Response:
+        if not settings.a2a_enabled:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        interface_url = a2a_base_url or "http://127.0.0.1:8000/a2a"
+        if not interface_url.rstrip("/").endswith("/a2a"):
+            interface_url = interface_url.rstrip("/") + "/a2a"
+        return JSONResponse(
+            content={
+                "name": "Blue Ice Project",
+                "description": "Privacy gateway for delegated text requests",
+                "supportedInterfaces": [{"url": interface_url, "protocolBinding": "JSONRPC"}],
+                "capabilities": {"streaming": False, "pushNotifications": False},
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+            }
+        )
+
+    async def a2a_rpc(request: Request) -> Response:
+        if not settings.a2a_enabled:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        denied = await require_local_auth(request)
+        if denied:
+            return denied
+        try:
+            payload = await request.json()
+            params = payload.get("params", {}) if isinstance(payload, dict) else {}
+            message = params.get("message", {}) if isinstance(params, dict) else {}
+            parts = message.get("parts", []) if isinstance(message, dict) else []
+            text = "\n".join(
+                str(part["text"])
+                for part in parts
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            ).strip()
+            if not text:
+                return JSONResponse(
+                    status_code=400, content={"detail": "A text message is required"}
+                )
+            result = await _adapter_chat(
+                {"model": settings.model, "messages": [{"role": "user", "content": text}]}
+            )
+            answer = "\n".join(_assistant_texts(result))
+            await asyncio.to_thread(
+                append_event,
+                settings.audit_path,
+                event="a2a_request",
+                outcome="allowed",
+                provider=settings.provider,
+                counts={"input_chars": len(text), "output_chars": len(answer)},
+                latency_ms=0,
+            )
+            return JSONResponse(
+                content={
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "result": {"message": {"role": "ROLE_AGENT", "parts": [{"text": answer}]}},
+                }
+            )
+        except PolicyBlocked as exc:
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"type": "aegis_policy_block", "message": str(exc)}},
+            )
+        except (ProviderRequestError, ValueError) as exc:
+            return JSONResponse(
+                status_code=502, content={"error": {"type": "provider_error", "message": str(exc)}}
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "aegis_error",
+                        "message": "Blue Ice Project could not safely complete this request",
+                    }
+                },
+            )
+
+    app.add_api_route("/a2a", a2a_rpc, methods=["POST"])
+    app.add_api_route("/a2a/", a2a_rpc, methods=["POST"])
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:
@@ -929,24 +1022,97 @@ def create_app(
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request) -> Response:
-        denied = await require_local_auth(request)
+        if not settings.native_anthropic_enabled:
+            if not resolve_provider_key(settings):
+                return JSONResponse(
+                    status_code=501,
+                    content={
+                        "error": {
+                            "type": "not_implemented",
+                            "message": "Native Anthropic route is disabled",
+                        }
+                    },
+                )
+            denied = await require_local_auth(request)
+            if denied:
+                return denied
+            try:
+                payload = await request.json()
+                translated = await _adapter_chat(anthropic_to_chat(payload))
+                if payload.get("stream") is True:
+                    return Response(
+                        content=chat_to_anthropic_sse(translated, model=payload["model"]),
+                        media_type="text/event-stream",
+                    )
+                return JSONResponse(content=chat_to_anthropic(translated, model=payload["model"]))
+            except PolicyBlocked as exc:
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": {"type": "aegis_policy_block", "message": str(exc)}},
+                )
+            except (ProviderRequestError, ValueError) as exc:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"type": "provider_error", "message": str(exc)}},
+                )
+        denied = await require_local_auth(request, ("authorization", "x-api-key"))
         if denied:
             return denied
         try:
             payload = await request.json()
-            chat_payload = anthropic_to_chat(payload)
-            result = await _adapter_chat(chat_payload)
-            if isinstance(payload, dict) and payload.get("stream") is True:
-                return Response(
-                    content=chat_to_anthropic_sse(result, model=chat_payload["model"]),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            vault = SessionVault(ttl_seconds=180.0)
+            clean_payload = _transform_strings(
+                copy.deepcopy(payload), lambda value: redact_text(value, vault)[0]
+            )
+            result = await forward_anthropic_messages(
+                clean_payload,
+                api_key=resolve_provider_key(settings, provider="anthropic") or "",
+                client=app.state.http_client,
+                max_response_bytes=settings.max_response_bytes,
+                client_headers=request.headers,
+            )
+            mapping = _collect_vault_mapping(clean_payload, vault)
+            if isinstance(result, bytes):
+                text = result.decode("utf-8", errors="replace")
+                findings = inspect_output(text, allowed_domains=settings.allowed_domains)
+                if findings:
+                    raise PolicyBlocked(
+                        [str(item.get("rule", "egress_policy_block")) for item in findings]
+                    )
+                replay = reconstruct(text, vault=mapping)[0].encode("utf-8")
+                await asyncio.to_thread(
+                    append_event,
+                    settings.audit_path,
+                    event="anthropic_request",
+                    outcome="allowed",
+                    provider="none",
+                    counts={},
+                    latency_ms=0,
                 )
-            return JSONResponse(content=chat_to_anthropic(result, model=chat_payload["model"]))
+                return Response(content=replay, media_type="text/event-stream")
+            output = "\n".join(_all_strings(result))
+            findings = inspect_output(output, allowed_domains=settings.allowed_domains)
+            if findings:
+                raise PolicyBlocked(
+                    [str(item.get("rule", "egress_policy_block")) for item in findings]
+                )
+            replay = _transform_strings(result, lambda value: reconstruct(value, vault=mapping)[0])
+            await asyncio.to_thread(
+                append_event,
+                settings.audit_path,
+                event="anthropic_request",
+                outcome="allowed",
+                provider="none",
+                counts={},
+                latency_ms=0,
+            )
+            return JSONResponse(content=replay)
         except PolicyBlocked as exc:
             return JSONResponse(
                 status_code=403,
-                content={"error": {"type": "aegis_policy_block", "message": str(exc)}},
+                content={
+                    "error": {"type": "aegis_policy_block", "message": str(exc), "rules": exc.rules}
+                },
             )
         except ScannerUnavailable:
             return JSONResponse(
@@ -978,22 +1144,71 @@ def create_app(
             )
 
     @app.post("/v1beta/models/{model}:generateContent")
+    @app.post("/v1beta/models/{model}:streamGenerateContent")
     async def gemini_generate_content(model: str, request: Request) -> Response:
-        denied = await require_local_auth(request)
+        if not settings.native_gemini_enabled:
+            if not resolve_provider_key(settings):
+                return JSONResponse(
+                    status_code=501,
+                    content={
+                        "error": {
+                            "type": "not_implemented",
+                            "message": "Native Gemini route is disabled",
+                        }
+                    },
+                )
+            denied = await require_local_auth(request)
+            if denied:
+                return denied
+            try:
+                payload = await request.json()
+                payload["model"] = model
+                translated = await _adapter_chat(gemini_to_chat(payload))
+                if payload.get("stream") is True:
+                    return Response(
+                        content=chat_to_gemini_sse(translated), media_type="text/event-stream"
+                    )
+                return JSONResponse(content=chat_to_gemini(translated))
+            except PolicyBlocked as exc:
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": {"type": "aegis_policy_block", "message": str(exc)}},
+                )
+            except (ProviderRequestError, ValueError) as exc:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"type": "provider_error", "message": str(exc)}},
+                )
+        denied = await require_local_auth(request, ("authorization", "x-goog-api-key"))
         if denied:
             return denied
         try:
             payload = await request.json()
-            payload["model"] = model
-            chat_payload = gemini_to_chat(payload)
-            result = await _adapter_chat(chat_payload)
-            if isinstance(payload, dict) and payload.get("stream") is True:
+            stream = request.url.path.endswith(":streamGenerateContent")
+            result = await forward_gemini_generate_content(
+                model,
+                payload,
+                api_key=resolve_provider_key(settings, provider="google") or "",
+                client=app.state.http_client,
+                max_response_bytes=settings.max_response_bytes,
+                stream=stream,
+            )
+            if isinstance(result, bytes):
+                normalized: list[str] = []
+                for line in result.decode("utf-8", errors="replace").splitlines():
+                    if line.startswith("data: "):
+                        try:
+                            line = "data: " + json.dumps(
+                                json.loads(line[6:]), separators=(",", ":")
+                            )
+                        except json.JSONDecodeError:
+                            pass
+                    normalized.append(line)
                 return Response(
-                    content=chat_to_gemini_sse(result),
+                    content=("\n".join(normalized) + "\n\n").encode(),
                     media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
-            return JSONResponse(content=chat_to_gemini(result))
+            return JSONResponse(content=result)
         except PolicyBlocked as exc:
             return JSONResponse(
                 status_code=403,
